@@ -3,6 +3,7 @@
 from .core import TreeNode
 from .interfaces import (
     BenchmarkClusterResult,
+    ClusterDef,
     CostModel,
     EvaluationResult,
     Evaluator,
@@ -16,6 +17,7 @@ from .search import UCTSearchEngine, random_rollout
 
 __all__ = [
     "BenchmarkClusterResult",
+    "ClusterDef",
     "CostAwareUCTScorer",
     "CostModel",
     "EvaluationResult",

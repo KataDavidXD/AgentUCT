@@ -6,6 +6,7 @@ from typing import Hashable
 
 from uct_engine import (
     BenchmarkClusterResult,
+    ClusterDef,
     CostAwareUCTScorer,
     EvaluationResult,
     Evaluator,
@@ -15,6 +16,8 @@ from uct_engine import (
     SearchState,
     UCTSearchEngine,
 )
+
+SINGLE_CLUSTER = [ClusterDef("c0", weight=1.0, base_cost=1.0)]
 
 
 # -- Minimal domain for testing -----------------------------------------------
@@ -76,7 +79,7 @@ class TestBasicSearch(unittest.TestCase):
         engine = UCTSearchEngine(
             evaluator=TinyEvaluator(),
             scorer=CostAwareUCTScorer(lambda_t=0.0),
-            cost_model=ReuseAwareCostModel(base_cost=1.0),
+            cost_model=ReuseAwareCostModel(clusters=SINGLE_CLUSTER),
             exploration_constant=1.4,
             random_seed=123,
         )
@@ -108,7 +111,7 @@ class TestBasicSearch(unittest.TestCase):
         engine = UCTSearchEngine(
             evaluator=TinyEvaluator(),
             scorer=CostAwareUCTScorer(lambda_t=0.0),
-            cost_model=ReuseAwareCostModel(base_cost=1.0),
+            cost_model=ReuseAwareCostModel(clusters=SINGLE_CLUSTER),
             exploration_constant=1.4,
             random_seed=99,
         )

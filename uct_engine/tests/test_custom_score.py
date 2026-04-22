@@ -6,6 +6,7 @@ from typing import Hashable
 
 from uct_engine import (
     BenchmarkClusterResult,
+    ClusterDef,
     CostAwareUCTScorer,
     EvaluationResult,
     Evaluator,
@@ -16,14 +17,15 @@ from uct_engine import (
     UCTSearchEngine,
 )
 
+ZERO_COST_CLUSTER = [ClusterDef("c0", weight=1.0, base_cost=0.0)]
 
-# -- Deterministic scorer that always favours the first action ---------------
 
-class FirstActionScorer(ScoreFunction):
-    """Always assigns descending scores to children in action order.
+# -- Deterministic scorer that always favours the least-visited child ---------
 
-    This ensures the engine *always* expands/selects the first available
-    action, making the search path fully deterministic.
+class LeastVisitedScorer(ScoreFunction):
+    """Prefers the child with fewest visits (like UCT exploration only).
+
+    Tracks call count to verify the engine actually calls the scorer.
     """
 
     def __init__(self) -> None:
@@ -38,15 +40,6 @@ class FirstActionScorer(ScoreFunction):
         exploration_constant: float,
     ) -> float:
         self._call_count += 1
-        # Lower child_visits => explored less => higher score in vanilla UCT.
-        # We override to always prefer the child that was expanded first
-        # (which gets more visits), by returning -child_visits.
-        # BUT actually, we want to *always pick the first action*.
-        # The engine iterates children in dict insertion order (action order),
-        # so we simply give a constant huge score minus the call count within
-        # a single _best_child sweep.  Simpler: just return -marginal_cost
-        # which is 0 for all.  Instead, return 1/(child_visits+1) to prefer
-        # the *most-visited* child, which is the first one expanded.
         return 1_000_000.0 / (child_visits + 1)
 
 
@@ -87,27 +80,22 @@ class OneSlotEvaluator(Evaluator):
 
 class TestCustomScorer(unittest.TestCase):
 
-    def test_first_action_scorer_dominates(self) -> None:
-        """With FirstActionScorer the engine should explore 'alpha' most."""
-        scorer = FirstActionScorer()
+    def test_custom_scorer_is_called(self) -> None:
+        """Inject LeastVisitedScorer and confirm it is actually invoked."""
+        scorer = LeastVisitedScorer()
         engine = UCTSearchEngine(
             evaluator=OneSlotEvaluator(),
             scorer=scorer,
-            cost_model=ReuseAwareCostModel(base_cost=0.0),
+            cost_model=ReuseAwareCostModel(clusters=ZERO_COST_CLUSTER),
             exploration_constant=1.4,
             random_seed=0,
         )
         result = engine.search(OneSlotState(), max_iterations=60)
         root = result.root_node
-        alpha_visits = root.children["alpha"].visit_count
-        beta_visits = root.children["beta"].visit_count
-        gamma_visits = root.children["gamma"].visit_count
 
-        # FirstActionScorer biases toward the least-visited child (via 1/(n+1)),
-        # so visits should be roughly balanced but scorer *was called*.
-        self.assertGreater(alpha_visits, 0)
-        self.assertGreater(beta_visits, 0)
-        self.assertGreater(gamma_visits, 0)
+        self.assertGreater(root.children["alpha"].visit_count, 0)
+        self.assertGreater(root.children["beta"].visit_count, 0)
+        self.assertGreater(root.children["gamma"].visit_count, 0)
         self.assertGreater(scorer._call_count, 0)
 
     def test_default_scorer_finds_best(self) -> None:
@@ -115,7 +103,7 @@ class TestCustomScorer(unittest.TestCase):
         engine = UCTSearchEngine(
             evaluator=OneSlotEvaluator(),
             scorer=CostAwareUCTScorer(lambda_t=0.0),
-            cost_model=ReuseAwareCostModel(base_cost=0.0),
+            cost_model=ReuseAwareCostModel(clusters=ZERO_COST_CLUSTER),
             exploration_constant=1.4,
             random_seed=7,
         )
