@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from typing import Hashable
 
-from .interfaces import CostModel, ScoreFunction, SearchContext, SearchState
+from .interfaces import ClusterDef, CostModel, ScoreFunction, SearchContext, SearchState
 
 
 # ---------------------------------------------------------------------------
@@ -17,7 +17,7 @@ from .interfaces import CostModel, ScoreFunction, SearchContext, SearchState
 # ---------------------------------------------------------------------------
 
 class CostAwareUCTScorer(ScoreFunction):
-    """Score_t(s,a) = Q + c_uct * sqrt(log(N_parent+1)/(N_child+1)) - lambda * marginal_cost
+    r"""Score_t(s,a) = Q + c_uct * sqrt(log(N_parent+1)/(N_child+1)) - lambda * marginal_cost
 
     .. math::
 
@@ -58,40 +58,42 @@ class CostAwareUCTScorer(ScoreFunction):
 # ---------------------------------------------------------------------------
 
 class ReuseAwareCostModel(CostModel):
-    r"""Path-reuse-aware marginal cost estimator (paper Section 3.4).
+    r"""Cluster-aware, path-reuse marginal cost estimator (paper Section 3.4).
 
-    In the paper, the true marginal cost of evaluating child(s,a) on
-    cluster z is:
+    Computes the weighted-average marginal cost across benchmark clusters:
 
     .. math::
 
-        \Delta C_t(s,a;z) = \sum_{m=1}^{M} c_m \cdot
-            \mathbf{1}[(\pi_{1:m}, z) \notin \mathcal{Path}_t]
+        \widehat{\Delta C}_t(s,a)
+        = \sum_{z \in \mathcal Z} \omega_z \cdot
+          \begin{cases}
+            0                    & (\text{prefix},\, z) \in \mathcal{Path}_t \\
+            \text{base\_cost}_z  & \text{otherwise}
+          \end{cases}
 
-    i.e. the sum of per-workflow-node costs for nodes whose path prefix
-    has NOT yet been materialized and cached.
+    For each cluster the model constructs a bipartite key
+    ``(prefix, cluster_id)`` and checks ``context.materialized_keys``
+    (the paper's Path_t).  If cached, that cluster contributes 0;
+    otherwise it contributes ``base_cost``.
 
-    This model simplifies the above to a binary estimate:
+    The state should expose ``path_key_for_action(action)`` returning
+    the config prefix after taking *action*.  If absent, the model
+    falls back to the full weighted-average base cost.
 
-    - **base_cost** if the child path key is NOT yet in Path_t
-      (represents the expected full execution cost of a new,
-      uncached path -- in practice this would be calibrated to
-      the average per-config evaluation cost in your domain).
-    - **0.0** if the child path key IS already in Path_t
-      (the path prefix is cached; execution can be restored
-      at zero recomputation cost via AgentGit).
-
-    For production use, subclass this and override ``marginal_cost``
-    to compute the real per-node, per-cluster cost from your AgentGit
-    backend.  The ``base_cost`` scalar is a reasonable starting point
-    for prototyping and unit tests.
-
-    Expects the state to expose ``path_key_for_action(action)`` via duck
-    typing.  If the method is absent the model falls back to *base_cost*.
+    Parameters
+    ----------
+    clusters : list[ClusterDef]
+        Benchmark cluster definitions.  Weights are auto-normalized
+        so they sum to 1.
     """
 
-    def __init__(self, base_cost: float = 1.0) -> None:
-        self.base_cost = base_cost
+    def __init__(self, clusters: list[ClusterDef]) -> None:
+        self.clusters = clusters
+        total_w = sum(c.weight for c in clusters)
+        if total_w > 0:
+            self._norm_weights = [c.weight / total_w for c in clusters]
+        else:
+            self._norm_weights = [1.0 / len(clusters)] * len(clusters)
 
     def marginal_cost(
         self,
@@ -101,8 +103,14 @@ class ReuseAwareCostModel(CostModel):
     ) -> float:
         key_fn = getattr(state, "path_key_for_action", None)
         if key_fn is None:
-            return self.base_cost
-        key = key_fn(action)
-        if key in context.materialized_keys:
-            return 0.0
-        return self.base_cost
+            return sum(
+                w * c.base_cost
+                for w, c in zip(self._norm_weights, self.clusters)
+            )
+        prefix = key_fn(action)
+        cost = 0.0
+        for w, c in zip(self._norm_weights, self.clusters):
+            bipartite_key = (prefix, c.cluster_id)
+            if bipartite_key not in context.materialized_keys:
+                cost += w * c.base_cost
+        return cost

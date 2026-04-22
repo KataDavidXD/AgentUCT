@@ -49,6 +49,18 @@ class SearchState(Protocol):
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ClusterDef:
+    """Definition of a benchmark cluster for cost modelling.
+
+    Used by ReuseAwareCostModel to compute per-cluster marginal cost
+    with bipartite (prefix, cluster_id) reuse keys.
+    """
+    cluster_id: str
+    weight: float = 1.0
+    base_cost: float = 1.0
+
+
+@dataclass
 class BenchmarkClusterResult:
     """Result from evaluating one configuration on one benchmark cluster.
 

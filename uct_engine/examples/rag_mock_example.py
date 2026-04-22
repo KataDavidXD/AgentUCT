@@ -21,6 +21,7 @@ from typing import Any, Hashable
 
 from uct_engine import (
     BenchmarkClusterResult,
+    ClusterDef,
     CostAwareUCTScorer,
     EvaluationResult,
     Evaluator,
@@ -165,7 +166,12 @@ class MockBenchmarkEvaluator(Evaluator):
 def main() -> None:
     evaluator = MockBenchmarkEvaluator()
     scorer = CostAwareUCTScorer(lambda_t=0.1)
-    cost_model = ReuseAwareCostModel(base_cost=1.0)
+    clusters = [
+        ClusterDef("cluster_A", weight=1.0, base_cost=1.0),
+        ClusterDef("cluster_B", weight=1.0, base_cost=1.5),
+        ClusterDef("cluster_C", weight=1.0, base_cost=0.8),
+    ]
+    cost_model = ReuseAwareCostModel(clusters=clusters)
 
     engine = UCTSearchEngine(
         evaluator=evaluator,
