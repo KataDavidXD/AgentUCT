@@ -3,9 +3,15 @@
 Path-reuse regularized UCT for discrete configuration search in agentic workflows and RAG pipelines.
 
 A lightweight, extensible UCT (Upper Confidence bounds applied to Trees) search
-engine for discrete compositional search spaces. Implements the  **AG-UCT (AgentUCT)**, a
-**Path-Reuse Regularized UCT** algorithm for RAG pipeline configuration search
-with history-dependent, reuse-aware cost regularization based on WTB and Agent Git https://github.com/KataDavidXD/WTB-AgenticWorkflowTestBench.
+engine for discrete compositional search spaces. Implements **AG-UCT
+(AgentUCT)**, a **Path-Reuse Regularized UCT** algorithm for RAG pipeline
+configuration search with history-dependent, reuse-aware cost regularization.
+
+The algorithm package is backend-agnostic: it can run with an in-memory mock
+evaluator, a lightweight RAG/question cache, or a WTB/AgentGit-backed evaluator.
+WTB is the production execution backend used by OminiRAG for file/state-level
+workflow cache and deterministic replay; it is not required for the core
+Agent-UCT search loop.
 
 **Zero external dependencies** -- stdlib only (`dataclasses`, `typing`, `abc`,
 `math`, `random`, `logging`).
@@ -62,7 +68,7 @@ J(x) = sum_z  w_z * R(x, z)
 Clustering serves two purposes: (1) reducing evaluation variance by aggregating
 instances, and (2) providing a natural unit for reuse accounting under AgentGit.
 
-### Path-level reuse (AgentGit)
+### Path-level reuse
 
 Given configuration `x` and cluster `z`, execution produces a workflow path:
 
@@ -70,12 +76,18 @@ Given configuration `x` and cluster `z`, execution produces a workflow path:
 pi(x, z) = (v_1, v_2, ..., v_M)
 ```
 
-Each prefix `pi_{1:m}(x, z)` is content-addressable. If two evaluations produce
-the same prefix hash under the same cluster, the cached state is restored
-instead of recomputed.
+Each prefix `pi_{1:m}(x, z)` can be represented by a cache key. If two
+evaluations produce the same prefix key under the same cluster, that prefix can
+be treated as already materialized and charged zero marginal cost.
 
 The engine maintains a **reuse graph** Path_t -- the set of (path-prefix, cluster)
 pairs already materialized. In code this is `context.materialized_keys`.
+
+In the standalone package this graph is an in-memory edge set. In the full
+OminiRAG runner, WTB/AgentGit can back the same logical graph with file/state
+checkpoints and replay. If your workload only needs RAG-result or question-level
+cache, a lighter evaluator can return equivalent `materialized_keys` without
+WTB.
 
 ### Marginal cost (history-dependent)
 
@@ -348,14 +360,17 @@ A mutable bag carried through one `search()` call:
 from uct_engine import (
     UCTSearchEngine,
     CostAwareUCTScorer,
+    ClusterDef,
     ReuseAwareCostModel,
 )
 from my_domain import MySearchState, MyEvaluator
 
 engine = UCTSearchEngine(
     evaluator=MyEvaluator(),
-    scorer=CostAwareUCTScorer(lambda_t=0.1),
-    cost_model=ReuseAwareCostModel(base_cost=1.0),
+    scorer=CostAwareUCTScorer(lambda_0=0.1),
+    cost_model=ReuseAwareCostModel(
+        clusters=[ClusterDef("cluster_A", weight=1.0, base_cost=1.0)],
+    ),
     exploration_constant=1.4,
     random_seed=42,
 )
@@ -387,8 +402,19 @@ The included example searches over a 3-slot RAG pipeline:
 
 The `MockBenchmarkEvaluator` simulates 3 benchmark clusters (Z = {cluster_A,
 cluster_B, cluster_C}) with per-cluster noise and heterogeneous execution costs.
-It returns `BenchmarkClusterResult` objects that populate Path_t, demonstrating
-that shared-prefix evaluations become free after the first materialization.
+It returns `BenchmarkClusterResult` objects whose `materialized_keys` populate
+Path_t, demonstrating that shared-prefix evaluations become free after the first
+materialization.
+
+This demo does not use WTB. It is the minimal self-contained Agent-UCT flow:
+
+1. `RAGSearchState` defines the discrete tree.
+2. `MockBenchmarkEvaluator` evaluates terminal configs and reports newly
+   materialized `(prefix, cluster_id)` keys.
+3. `ReuseAwareCostModel` reads `context.materialized_keys` as the logical
+   bipartite reuse graph.
+4. `UCTSearchEngine` updates tree statistics and returns the best observed
+   configuration by reward.
 
 Run it:
 
@@ -429,7 +455,7 @@ cd AG-UCT
 python -m unittest discover -s uct_engine/tests -v
 ```
 
-12 tests covering:
+14 tests covering:
 
 - Basic search correctness and best-result tracking
 - Cost budget termination
@@ -440,17 +466,33 @@ python -m unittest discover -s uct_engine/tests -v
 
 ---
 
+## Cache backends
+
+Agent-UCT only requires a cost signal and a set of materialized reuse keys. The
+cache backend can be chosen by the evaluator:
+
+| Backend | What is cached | When to use |
+| ------- | -------------- | ----------- |
+| In-memory mock | `(prefix, cluster_id)` logical keys | Algorithm tests and toy demos |
+| Lightweight RAG/question cache | Retrieved docs, generated answers, per-question scores, or `(prefix, qid)` keys | When you only need RAG/question-level reuse |
+| WTB/AgentGit | File/state checkpoints, workspace snapshots, API cache, replay metadata | When workflow execution state must be restored exactly across branches or processes |
+
+WTB therefore sits below the evaluator as a file/state-level cache and replay
+layer. It can make the logical reuse graph physically real, but the AG-UCT
+package itself does not depend on WTB.
+
 ## Adapting for the real RAG paper setting
 
-1. **Evaluator**: Replace `MockBenchmarkEvaluator` with a real evaluator that
-  runs configurations through WTB on actual benchmark clusters. Each cluster
-   evaluation should return a `BenchmarkClusterResult` with real
-   `materialized_keys` from AgentGit's content-addressable state hashing.
+1. **Evaluator**: Replace `MockBenchmarkEvaluator` with a real evaluator. For a
+  lightweight setup, use a RAG/question cache and return
+   `BenchmarkClusterResult.materialized_keys` for the prefixes that were reused
+   or materialized. For the OminiRAG production setting, use WTB/AgentGit to
+   back those keys with file/state checkpoints and deterministic replay.
 2. **SearchState**: Replace `RAGSearchState` slots with your real component
   option lists (embedding model, chunking strategy, retriever, reranker,
    top-k, generation mode, etc.).
 3. **CostModel**: Subclass `ReuseAwareCostModel` to compute real per-node,
-  per-cluster marginal costs from AgentGit, matching the paper's
+  per-cluster marginal costs from your cache backend, matching the paper's
    delta_C_t(s,a;z) = sum_m c_m * 1[(pi_{1:m}, z) not in Path_t].
 4. **SearchContext**: `context.materialized_keys` maps directly to Path_t.
   The evaluator populates `materialized_keys` in each cluster result;
@@ -461,4 +503,3 @@ python -m unittest discover -s uct_engine/tests -v
 6. **Budget mode**: Pass `max_cost=B_tot` to `engine.search()` to use the
   paper's cost-budget termination (Algorithm 1 line 5) instead of or in
    addition to iteration-based termination.
-

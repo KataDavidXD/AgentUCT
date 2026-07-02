@@ -13,7 +13,13 @@ from .interfaces import (
     SearchState,
 )
 from .scoring import CostAwareUCTScorer, ReuseAwareCostModel
-from .search import UCTSearchEngine, random_rollout
+from .search import (
+    IterationRecord,
+    OnIterationCallback,
+    UCTSearchEngine,
+    random_rollout,
+    update_cached_qids,
+)
 
 __all__ = [
     "BenchmarkClusterResult",
@@ -22,6 +28,8 @@ __all__ = [
     "CostModel",
     "EvaluationResult",
     "Evaluator",
+    "IterationRecord",
+    "OnIterationCallback",
     "ReuseAwareCostModel",
     "ScoreFunction",
     "SearchContext",
@@ -30,4 +38,5 @@ __all__ = [
     "TreeNode",
     "UCTSearchEngine",
     "random_rollout",
+    "update_cached_qids",
 ]

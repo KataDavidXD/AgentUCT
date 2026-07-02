@@ -172,5 +172,6 @@ class ScoreFunction(ABC):
         child_q: float,
         marginal_cost: float,
         exploration_constant: float,
+        iteration: int = 1,
     ) -> float:
         ...

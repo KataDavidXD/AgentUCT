@@ -17,25 +17,28 @@ from .interfaces import ClusterDef, CostModel, ScoreFunction, SearchContext, Sea
 # ---------------------------------------------------------------------------
 
 class CostAwareUCTScorer(ScoreFunction):
-    r"""Score_t(s,a) = Q + c_uct * sqrt(log(N_parent+1)/(N_child+1)) - lambda * marginal_cost
+    r"""Agent-UCT_t(s,a) = Q + c_uct * sqrt(log(N+1)/(n+1)) - (lambda_0/sqrt(t)) * cost
 
     .. math::
 
-        \mathrm{Score}_t(s,a)
+        \mathrm{Agent\text{-}UCT}_t(s,a)
         = \hat Q_t(s,a)
         + c_{\mathrm{uct}} \sqrt{\frac{\log(N_t(s)+1)}{N_t(s,a)+1}}
-        - \lambda_t \, \widehat{\Delta C}_t(s,a)
+        - \frac{\lambda_0}{\sqrt{t}} \, \widehat{\Delta C}_t(s,a)
 
     Parameters
     ----------
-    lambda_t : float
-        Cost regularization weight (the paper's lambda_t).
-        Controls the quality-cost tradeoff during search.
+    lambda_0 : float
+        Initial cost regularization weight.  Decays as lambda_0/sqrt(t).
         When 0 this degenerates to vanilla UCT.
+    lambda_t : float
+        Deprecated alias for lambda_0 (backward compat).
     """
 
-    def __init__(self, lambda_t: float = 0.0) -> None:
-        self.lambda_t = lambda_t
+    def __init__(self, lambda_0: float = 0.0, *, lambda_t: float | None = None) -> None:
+        if lambda_t is not None and lambda_0 == 0.0:
+            lambda_0 = lambda_t
+        self.lambda_0 = lambda_0
 
     def score(
         self,
@@ -44,12 +47,14 @@ class CostAwareUCTScorer(ScoreFunction):
         child_q: float,
         marginal_cost: float,
         exploration_constant: float,
+        iteration: int = 1,
     ) -> float:
         exploitation = child_q
         exploration = exploration_constant * math.sqrt(
             math.log(parent_visits + 1) / (child_visits + 1)
         )
-        cost_penalty = self.lambda_t * marginal_cost
+        lambda_t = self.lambda_0 / math.sqrt(max(1, iteration))
+        cost_penalty = lambda_t * marginal_cost
         return exploitation + exploration - cost_penalty
 
 
@@ -58,33 +63,26 @@ class CostAwareUCTScorer(ScoreFunction):
 # ---------------------------------------------------------------------------
 
 class ReuseAwareCostModel(CostModel):
-    r"""Cluster-aware, path-reuse marginal cost estimator (paper Section 3.4).
+    r"""Adaptive item-level marginal cost estimator.
 
-    Computes the weighted-average marginal cost across benchmark clusters:
+    Computes per-batch hit probability for each spectrum:
 
     .. math::
 
         \widehat{\Delta C}_t(s,a)
-        = \sum_{z \in \mathcal Z} \omega_z \cdot
-          \begin{cases}
-            0                    & (\text{prefix},\, z) \in \mathcal{Path}_t \\
-            \text{base\_cost}_z  & \text{otherwise}
-          \end{cases}
+        = \sum_{z \in \mathcal Z} \omega_z \cdot c_{d+1}(s,a,z) \cdot
+          \left(1 - \frac{|\mathcal Q_t(p(s,a),z) \cap \mathcal{Batch}_z|}
+                         {|\mathcal{Batch}_z|}\right)
 
-    For each cluster the model constructs a bipartite key
-    ``(prefix, cluster_id)`` and checks ``context.materialized_keys``
-    (the paper's Path_t).  If cached, that cluster contributes 0;
-    otherwise it contributes ``base_cost``.
-
-    The state should expose ``path_key_for_action(action)`` returning
-    the config prefix after taking *action*.  If absent, the model
-    falls back to the full weighted-average base cost.
+    When ``context.extra["current_batches"]`` is populated (adaptive mode),
+    the model computes exact per-batch hit rates against
+    ``context.extra["cached_qids"]``.  Otherwise falls back to the legacy
+    binary Path_t check for backward compatibility.
 
     Parameters
     ----------
     clusters : list[ClusterDef]
-        Benchmark cluster definitions.  Weights are auto-normalized
-        so they sum to 1.
+        Benchmark cluster definitions.  Weights are auto-normalized.
     """
 
     def __init__(self, clusters: list[ClusterDef]) -> None:
@@ -108,9 +106,40 @@ class ReuseAwareCostModel(CostModel):
                 for w, c in zip(self._norm_weights, self.clusters)
             )
         prefix = key_fn(action)
+
+        current_batches = context.extra.get("current_batches")
+        if current_batches is not None:
+            return self._adaptive_cost(prefix, context, current_batches)
+
+        # Legacy fallback: binary Path_t check
         cost = 0.0
         for w, c in zip(self._norm_weights, self.clusters):
             bipartite_key = (prefix, c.cluster_id)
             if bipartite_key not in context.materialized_keys:
                 cost += w * c.base_cost
+        return cost
+
+    def _adaptive_cost(
+        self,
+        prefix: Hashable,
+        context: SearchContext,
+        current_batches: dict[str, list[str]],
+    ) -> float:
+        """Per-batch hit probability cost: cost_z = base_cost * (1 - hit_prob)."""
+        cached_qids = context.extra.get("cached_qids", {})
+        cost = 0.0
+        for w, c in zip(self._norm_weights, self.clusters):
+            sid = c.cluster_id
+            batch_z = current_batches.get(sid)
+            if not batch_z:
+                cost += w * c.base_cost
+                continue
+            cached_z = cached_qids.get((prefix, sid))
+            if cached_z:
+                batch_set = set(batch_z)
+                hit_count = len(cached_z & batch_set)
+                hit_prob = hit_count / len(batch_z)
+            else:
+                hit_prob = 0.0
+            cost += w * c.base_cost * (1.0 - hit_prob)
         return cost

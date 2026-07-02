@@ -1,4 +1,13 @@
-"""Mock RAG pipeline search demonstrating the UCT engine.
+"""Standalone mock RAG pipeline search demonstrating Agent-UCT.
+
+This demo intentionally does not use WTB. It shows the minimum contract needed
+by the AG-UCT package:
+
+* SearchState defines a discrete prefix tree.
+* Evaluator scores terminal configurations.
+* Evaluator returns newly materialized ``(prefix, cluster_id)`` keys.
+* ReuseAwareCostModel reads ``context.materialized_keys`` as the logical
+  bipartite reuse graph.
 
 Slots
 -----
@@ -6,9 +15,10 @@ Slots
   reranker  : none | bge
   topk      : 5 | 10
 
-The evaluator simulates 3 benchmark clusters and returns per-cluster
-results with materialized_keys so the ReuseAwareCostModel can track
-path-prefix reuse across iterations.
+The evaluator simulates 3 benchmark clusters and returns per-cluster results
+with ``materialized_keys`` so ``ReuseAwareCostModel`` can track path-prefix
+reuse across iterations. A real evaluator could replace these logical keys with
+RAG/question cache keys, or with WTB-backed file/state checkpoint keys.
 
 Run::
 
@@ -17,7 +27,7 @@ Run::
 from __future__ import annotations
 
 import sys
-from typing import Any, Hashable
+from typing import Hashable
 
 from uct_engine import (
     BenchmarkClusterResult,
@@ -110,6 +120,8 @@ CLUSTER_COST: dict[str, float] = {
     "cluster_C": 0.8,
 }
 
+EXPECTED_BEST = ("dense", "bge", "10")
+
 
 class MockBenchmarkEvaluator(Evaluator):
     """Simulates benchmark-cluster-based evaluation.
@@ -134,7 +146,8 @@ class MockBenchmarkEvaluator(Evaluator):
             base_reward = REWARD_TABLE.get(choices, 0.0)
             reward = base_reward + CLUSTER_NOISE[cid]
 
-            # Determine reuse: check each prefix against materialized_keys
+            # Logical bipartite reuse graph edge: (configuration prefix, cluster).
+            # The engine harvests these edges into context.materialized_keys.
             new_keys: list[Hashable] = []
             cluster_cost = 0.0
             for depth in range(1, len(choices) + 1):
@@ -163,9 +176,21 @@ class MockBenchmarkEvaluator(Evaluator):
 # Main demo
 # ---------------------------------------------------------------------------
 
+def _materialized_keys_by_depth(keys: set[Hashable]) -> dict[int, int]:
+    """Count logical reuse edges by configuration-prefix depth."""
+    counts: dict[int, int] = {}
+    for key in keys:
+        if not isinstance(key, tuple) or len(key) != 2:
+            continue
+        prefix, _cluster_id = key
+        if isinstance(prefix, tuple):
+            counts[len(prefix)] = counts.get(len(prefix), 0) + 1
+    return dict(sorted(counts.items()))
+
+
 def main() -> None:
     evaluator = MockBenchmarkEvaluator()
-    scorer = CostAwareUCTScorer(lambda_t=0.1)
+    scorer = CostAwareUCTScorer(lambda_0=0.1)
     clusters = [
         ClusterDef("cluster_A", weight=1.0, base_cost=1.0),
         ClusterDef("cluster_B", weight=1.0, base_cost=1.5),
@@ -185,14 +210,21 @@ def main() -> None:
     result = engine.search(root, max_iterations=200)
 
     print("=" * 60, flush=True)
-    print("  UCT Search Complete", flush=True)
+    print("  Standalone Agent-UCT Search Complete", flush=True)
     print("=" * 60, flush=True)
+    print("  Cache backend: in-memory logical bipartite graph", flush=True)
     print(f"  Best config : {result.best_state.pretty()}", flush=True)
+    print(f"  Expected    : {EXPECTED_BEST}", flush=True)
     print(f"  Best reward : {result.best_reward:.4f}", flush=True)
     print(f"  Iterations  : {result.iterations}", flush=True)
     print(f"  Evaluations : {result.total_evaluations}", flush=True)
     print(f"  Total cost  : {result.total_cost:.2f}", flush=True)
     print(f"  Materialized keys: {len(result.context.materialized_keys)}", flush=True)
+    print(
+        f"  Keys by prefix depth: "
+        f"{_materialized_keys_by_depth(result.context.materialized_keys)}",
+        flush=True,
+    )
     print("=" * 60, flush=True)
 
     # Show root children stats

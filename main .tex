@@ -1,0 +1,679 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+
+% --- 数学宏包引入 ---
+\usepackage{amsmath, amsfonts, amssymb, mathtools}
+\usepackage{amsthm}
+\usepackage{bm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[numbers, square, sort&compress]{natbib}
+\usepackage[colorlinks=true, citecolor=blue, linkcolor=black, urlcolor=blue]{hyperref}
+
+\title{Agent-UCT: Upper Confidence Bound Applied to Trees for Agentic Workflow Optimization with Cost-Awareness}
+\author{
+    Yang Li\textsuperscript{1} \quad 
+    Ye Luo\textsuperscript{1*}\footnotetext{*~Corresponding author and Supervisor.} 
+    \\
+    \vspace{0.2cm}
+    \small \textsuperscript{1}The University of Hong Kong \\
+    \small \texttt{\{Yli9919, kurtluo\}@hku.hk}
+}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+    OmniRAG, a unified framework for the standardization, optimization, and efficient evaluation of retrieval-augmented generation (RAG) systems. 
+
+Agent-UCT (Agent-based Cost-Aware Upper Confidence Tree), a novel algorithm for discrete RAG optimization under evaluation budgets with bipartite prefix graph.
+
+WTB (Workflow Test Bench), a production-grade execution and evaluation backbone that ensures deterministic replay, content-addressable caching, and transactional consistency for agentic workflows.
+\end{abstract}
+
+\section{Introduction}
+
+    Agentic workflows have emerged as a powerful paradigm for automating complex, multi-step tasks through the orchestration of large language models (LLMs) with external tools, retrieval mechanisms, and decision-making modules. Unlike single-turn prompting, agentic systems exhibit iterative reasoning, stateful execution, and dynamic adaptation—capabilities that are essential for applications such as retrieval-augmented generation (RAG), code assistance, scientific reasoning, and autonomous software agents.
+
+    A fundamental challenge in deploying agentic workflows is optimization: selecting the optimal workflow configuration of discrete components that govern agent behavior. In a RAG agent, for example, the workflow comprises components such as chunking strategy, embedding model, retrieval top-$k$, reranking method, generation prompt, and reflection schedule. Each component offers discrete choices, and the full configuration space grows combinatorially as the product of these options. Even moderately sized pipelines (e.g., 5 components with 3–5 options each) yield hundreds to thousands of candidate configurations.
+
+    Evaluating a single agentic workflow configuration is expensive. Each evaluation requires executing the agent across multiple benchmarks or tasks, involving repeated LLM inference calls, retrieval operations, and tool invocations. A single forward pass can take seconds to minutes, and systematic optimization over thousands of configurations becomes computationally prohibitive. Moreover, agentic workflows are stateful: intermediate states (e.g., retrieved documents, cached embeddings, conversation history) depend on the execution prefix. When two configurations share a common prefix—such as the same chunking strategy and embedding model—executing that prefix repeatedly across evaluations results in substantial redundant computation.
+
+    Existing optimization approaches fall short in addressing these challenges. Heuristic grid search or random sampling ignores the combinatorial structure and wastes evaluation budget on unpromising regions. Black-box optimization methods, including Bayesian optimization and reinforcement learning, treat the workflow as a monolithic function and cannot exploit the compositional reuse of prefixes. Multi-armed bandit algorithms assume independent arms rather than structured dependencies. Standard tree search methods, such as Monte Carlo Tree Search (MCTS) and its UCT (Upper Confidence Bounds Applied to Trees) variant \citep{kocsis2006bandit, coquelin2007bandit}, are designed for planning domains like games where node evaluations are simulated at low cost and exhibit no computational reuse across branches. In agentic workflow optimization, however, the cost of evaluating a configuration is path-dependent, and shared prefixes create explicit reuse opportunities that standard UCT ignores.
+
+    This paper addresses the problem of discrete agentic workflow optimization under evaluation budgets—that is, finding a near-optimal configuration within a limited number of costly evaluations, where each evaluation can reuse previously materialized prefix states.
+
+    We propose Agent-UCT (Agent-based Cost-Aware Upper Confidence Bound Applied to Trees), a novel tree search algorithm that extends UCT with a reuse-aware regularization term. Agent-UCT operates on a search tree where nodes represent partial workflow configurations (prefixes). The selection policy at each node balances the standard UCT exploration-exploitation trade-off against a \textit{cost regularization term} derived from the marginal execution cost of expanding to a child node. This marginal cost is computed based on a bipartite reuse graph that tracks which configuration prefixes have already been materialized for which benchmark clusters. By favoring branches with lower expected additional cost—i.e., those that reuse previously cached states—Agent-UCT efficiently allocates evaluation budget toward novel, high-potential configurations while avoiding redundant computation.
+
+Our methodological contributions are threefold:
+
+\begin{enumerate}
+    \item \textbf{Cost-aware UCT selection policy.} We augment the standard UCT score with a regularization term $-\lambda_t \widehat{\Delta C}_t(s,a)$, where $\widehat{\Delta C}_t(s,a)$ estimates the marginal computational cost of expanding from state $s$ via action $a$, conditioned on the current reuse graph. This biases the search toward branches that leverage previously materialized prefixes.
+    
+    \item \textbf{Bipartite reuse graph for state tracking.} We formalize the reuse structure of agentic workflow evaluation as a bipartite graph $G_t = (\mathcal P_t, \mathcal Z, \mathcal E_t)$ connecting configuration prefixes $\mathcal P_t$ to benchmark clusters $\mathcal Z$. This graph enables efficient estimation of marginal costs and guides the adaptive selection of evaluation minibatches.
+    
+    \item \textbf{Integration with versioned execution.} Agent-UCT is designed to operate atop AgentGit \citep{li2025agentgit} and WTB (Workflow Test Bench), a production-grade execution backbone that provides deterministic replay, content-addressable caching, and transactional consistency. This integration ensures that the reuse estimates are accurate and that cached states are materialized once and reused across the search.
+\end{enumerate}
+
+    The remainder of this paper is organized as follows. Section 2 reviews related work in agentic workflow optimization, tree search algorithms, and reproducible execution frameworks. Section 3 formalizes the problem setup, defines the search space and reuse graph, and presents the Agent-UCT algorithm. Section 4 describes our experimental methodology, including benchmarks, baseline comparisons, and evaluation protocols. Section 5 concludes the paper with a discussion of limitations and future directions.
+
+
+\section{Related Work}
+
+\subsection{RAG optimization}
+
+    Retrieval-augmented generation (RAG) has emerged as a critical paradigm for enhancing large language models with external knowledge \citep{gao2023retrieval}. Recent work has focused on optimizing individual components of the RAG pipeline, including chunking strategies, embedding models, retrieval top-k, reranking methods, and generation prompts.
+
+    Common evaluation benchmarks include HotpotQA \citep{yang2018hotpotqa} for multi-hop reasoning and UltraDomain \citep{qian2025memorag} for domain-specific retrieval. LongRAG addresses multi-hop questions by incorporating both the question and retrieved context into a unified framework \citep{jiang2024longrag}. Self-RAG introduces iterative retrieval-generation cycles with reflection tokens \citep{asai2024self}, while LightRAG leverages knowledge graph structures for efficient retrieval \citep{guo2024lightrag}.
+
+    Despite these advances, most existing approaches optimize RAG components in isolation or through heuristic grid search, which becomes infeasible as the number of components grows. Our work addresses this limitation by framing RAG optimization as a tree search problem over a discrete compositional space, enabling systematic exploration of the full pipeline.
+
+\subsection{Tree search and cost of transformer}
+
+    Bandit-based tree search methods have been successfully applied to large-scale planning problems. UCB1 provides a near-optimal solution to the multi-armed bandit problem by balancing exploration and exploitation \citep{auer2002finite}. UCT (Upper Confidence Bounds Applied to Trees) extends this principle to tree-structured decision processes \citep{kocsis2006bandit, coquelin2007bandit}, treating node selection as a local bandit and backpropagating values from simulated rollouts.
+
+    However, applying UCT to transformer-based agentic workflows introduces unique challenges. Unlike traditional planning domains (e.g., games), evaluating a complete configuration requires executing expensive transformer inference across multiple benchmarks. The computational cost of a single forward pass can be prohibitive, and similar configuration prefixes often result in redundant computation.
+
+    Recent work has explored cost-aware bandit algorithms, but these typically assume fixed per-action costs rather than path-dependent reuse opportunities. Our Agent-UCT algorithm introduces a reuse-aware regularization term that explicitly accounts for the marginal cost of exploring new branches, leveraging execution caching to avoid redundant computation.
+
+
+\subsection{Reproducible Agentic workflow}
+
+    Reproducibility is a fundamental challenge in agentic workflow research due to the non-deterministic nature of LLM outputs, API dependencies, and stateful execution.
+
+    Chatbot Frameworks. General-purpose agent frameworks such as Agno and AutoGen \citep{wu2024autogen} provide flexible abstractions for building conversational agents but lack built-in support for deterministic replay or execution caching.
+
+    Stateful Workflow Frameworks. LangChain and LangGraph offer directed graph abstractions for composing LLM calls with branching and persistence. However, their state management is primarily designed for application-level checkpointing rather than systematic workflow optimization.
+
+    Versioned Execution. Our prior work, AgentGit, introduces version control semantics for agentic workflows, maintaining persistent state of both the workspace and the agent through versioned execution \citep{li2025agentgit}. This enables deterministic replay and content-addressable caching of intermediate states. WTB (Workflow Test Bench) extends AgentGit into a production-grade backbone, providing transactional consistency and API-level caching for reproducible evaluation.
+
+    To our knowledge, no existing framework combines reuse-aware tree search with versioned execution caching for RAG optimization. Agent-UCT and WTB together fill this gap by providing both an efficient search algorithm and a reproducible execution substrate.
+
+
+\section{Method}
+
+We propose Agent-UCT, a reuse-aware tree search algorithm for discrete agentic workflow optimization. Agent-UCT builds on UCT as the underlying tree search framework, while introducing an AgentGit-based cost-exploration regularization term that favors branches with lower exploration computation cost through execution reuse.
+
+We consider the problem of optimizing an agentic workflow, such as a RAG pipeline, over a discrete compositional search space.
+
+A complete configuration is defined as 
+\[
+x = (o_1, o_2, \dots, o_L), \qquad o_\ell \in \mathcal{O}_\ell,
+\]
+where $\ell$ refers to the level of the component, and $o_\ell$ denotes the selected option of the component at level $\ell$.
+
+Therefore, the full search space is defined as 
+\[
+\mathcal{X} = \mathcal{O}_1 \times \mathcal{O}_2 \times \cdots \times \mathcal{O}_L .
+\]
+
+In the RAG scenarios considered here, a complete configuration must span from level 1 to level $L$, which means that all RAG components, from chunking to answer generation, must be assigned. The nature of this problem induces a search tree structure, where each tree node represents a partial configuration and a tree path terminates when a configuration is completed.
+
+The search space $\mathcal{X}$ grows combinatorially with the number of levels, making exhaustive search unfavorable. Therefore, we build on Upper Confidence Trees (UCT), an extension of UCB from multi-armed bandits to tree search. In the standard UCT algorithm, the selection of a child node is treated as a local bandit problem and is governed by a UCB score, and node values are updated by backpropagating evaluations from fully expanded branches, as proposed by Kocsis and Szepesvári (2006).
+
+In RAG scenarios, the evaluation of a complete workflow is expensive, requiring performance assessment over multiple benchmarks. Moreover, the exploration of similar branches often leads to recomputation of shared workflow configuration prefixes.
+
+Our prior work, AgentGit, maintains a persistent state of both the workspace and the agent through versioned execution, allowing reuse of previously materialized workflow configuration prefixes.
+
+This motivates Agent-UCT, a cost-aware UCT policy for agentic workflows with a path-dependent marginal cost regularizer derived from AgentGit-based execution reuse.
+
+\subsection{Problem Setup}
+
+
+\subsubsection{Search Formulation}
+% 定义 x, X, s, child(s,a)
+
+A search state \(s\) is defined as 
+
+\[
+s = (o_1, \dots, o_d), \qquad d \in \{0,1,\dots,L\} .
+\]
+
+
+At depth \(d<L\), an action \(a \in \mathcal O_{d+1}\) selects the component at the next level  \(d+1\), and the resulting child state is
+\[
+\mathrm{Child}(s,a) = (o_1,\dots,o_d,a).
+\]
+
+
+When \(d=L\), the state is terminal and corresponds to a complete configuration:
+\[
+x_s=s\in\mathcal X.
+\]
+
+\subsubsection{Benchmark Clusters }
+% 定义 z, path, Path_t, AgentGit reuse graph
+
+
+
+
+A full configuration is evaluated over benchmark clusters, where each cluster consists of a subset of questions drawn from one or more benchmarks:
+
+\[
+\mathcal Z = \{z_1, z_2, \dots, z_K\}.
+\]
+
+\(R(x,z)\) represents the reward of a full configuration \(x\) on cluster \(z\). The total reward is calculated as 
+
+\[
+J(x) = \sum_{z \in \mathcal Z} w_z R(x,z) ,
+\]
+
+where \(w_z \ge 0\) and
+\[
+\sum_{z\in\mathcal Z}w_z=1.
+\]
+
+For equal importance of benchmark clusters, 
+\[
+J(x) = \frac{1}{K} \sum_{k=1}^{K} R(x, z_k)
+\]
+
+The benchmark clusters allow us to construct a sampling-based evaluation algorithm to estimate the cluster reward from sampled question batches, which further reduces the evaluation cost of Agent-UCT.
+
+
+\subsubsection{WTB, AgentGit and Path Reuse}
+
+WTB is the production version of AgentGit, serving as the runtime backbone of our framework.
+
+For a full configuration \(x\) and a benchmark cluster \(z\), we define
+\[
+\sigma_m(x,z) = F_m(x_{1:m}, z)
+\]
+
+
+as the system state, including the workspace and the agent, after executing the first \(m\) selected components of \(x\) on benchmark cluster \(z\). 
+
+This \(\sigma_m(x,z)\) is uniquely determined by the configuration prefix \((x_{1:m}, z)\), under the deterministic workflow control of WTB, including API caching and transactional consistency control.
+
+Therefore, we define the corresponding content-addressable cache key as
+
+\[
+h_m(x,z) = \mathrm{Hash}(\sigma_m(x,z)).
+\]
+This means that the state is reusable only for the same configuration prefix and benchmark cluster \((x_{1:m}, z)\). 
+
+
+To formalize this structure, we define a bipartite reuse graph
+
+\[
+G_t = (\mathcal P_t, \mathcal Z, \mathcal E_t),
+\]
+where \(\mathcal P_t\) is the set of selected configuration paths, \(\mathcal Z\) is the set of benchmark clusters, and
+\[
+\mathcal E_t \subseteq \mathcal P_t \times \mathcal Z
+\]
+represents the materialized \((x_{1:m}, z)\). Also, 
+\[
+(x_{1:m}, z) \in \mathcal E_t
+\]
+means that \((x_{1:m}, z)\) has already been materialized, and therefore the computation cost of configuration 
+\((x_{1:m})\) for cluster \(z\) is waived for any subsequent expansion of child nodes.
+
+
+We therefore define the marginal search cost of \((d+1)\)-th component as
+\[
+\Delta C_t(s,a;z)
+=
+c_{d+1}(s,a,z)\,
+\mathbf 1\!\left[
+(\mathrm{Child}(s,a), z)\notin \mathcal E_t
+\right].
+\]
+
+
+For a minibatch \(\mathcal Z_t \subseteq \mathcal Z\), the aggregated marginal cost estimate is
+\[
+\widehat{\Delta C}_t(s,a)
+=
+\sum_{z \in \mathcal Z_t} \omega_z \Delta C_t(s,a;z).
+\]
+
+
+For a complete configuration \(x\), 
+\[
+\Delta C_t(x;z)
+=
+\sum_{m=1}^{L}
+c_m(x,z)\,
+\mathbf 1\!\left[
+(x_{1:m}, z)\notin \mathcal E_t
+\right].
+\]
+
+
+\subsection{UCT with Prefix-State Reuse}
+
+As stated above, the bipartite reuse graph is defined as 
+\[
+G_t=(\mathcal P_t,\mathcal Z,\mathcal E_t),
+\]
+to estimate the marginal cost of expanding each candidate prefix. In a
+nonterminal state \(s\), an action \(a\in\mathcal O_{d+1}\) induces the child
+prefix
+\[
+p(s,a)=\mathrm{Child}(s,a).
+\]
+Here,  \((p(s,a),z)\in\mathcal E_t\) means that the selected prefix has already been materialized 
+for cluster \(z\), and the cached WTB states will be reused.
+Otherwise, an additional marginal execution cost will be incurred. Thus, Agent-UCT computes the marginal cost estimate from the bipartite reuse graph, denoted by 
+\(\widehat{\Delta C}_t(s,a)\).
+
+Agent-UCT selects the action with the largest cost-aware UCT score:
+\[
+\mathrm{Agent\text{-}UCT}_t(s,a)
+=
+\hat Q_t(s,a)
++
+c_{\mathrm{UCT}}
+\sqrt{
+\frac{\log(N_t(s)+1)}
+{N_t(s,a)+1}
+}
+-
+\lambda_t \widehat{\Delta C}_t(s,a) .
+\]
+Here, \(N_t(s)\) is the visit count of state \(s\), \(N_t(s,a)\) is the visit count of edge \((s,a)\), and \(\hat Q_t(s,a)\) is the empirical reward estimate of taking action \(a\) from state \(s\). The parameter
+\(c_{\mathrm{UCT}}>0\) is the standard UCT exploration parameter.
+
+The search starts from the root state \(s_{\emptyset}\). At iteration \(t\),
+Agent-UCT repeatedly applies the above tree policy until it reaches either a terminal state or a node with unexpanded actions. If the selected node is nonterminal, Agent-UCT expands one untried action and continues until a terminal configuration is obtained.
+The selected path is
+\[
+\tau_t
+=
+\bigl((s_0,a_0),(s_1,a_1),\dots,(s_{L-1},a_{L-1})\bigr),
+\]
+where
+\[
+s_0=s_{\emptyset},
+\qquad
+s_{m+1}=\mathrm{Child}(s_m,a_m).
+\]
+The terminal configuration evaluated at iteration \(t\) is 
+\[
+x_t\in\mathcal X.
+\]
+
+In full-pool evaluation, \(x_t\) is evaluated over all benchmark clusters and all questions. The
+cluster reward is \(R(x_t,z)\), and the scalar reward used for backpropagation
+is
+\[
+J(x_t)
+=
+\sum_{z\in\mathcal Z}
+w_z R(x_t,z),
+\qquad
+w_z\ge 0,\quad \sum_{z\in\mathcal Z}w_z=1.
+\]
+For equal cluster weights, this reduces to
+\[
+J(x_t)
+=
+\frac{1}{K}
+\sum_{k=1}^{K}
+R(x_t,z_k).
+\]
+
+In sampling mode, the evaluator instead returns a sampled reward estimate
+\[
+\widehat J_t(x_t)
+=
+\sum_{z\in\mathcal Z}
+w_z \widehat R_t(x_t,z),
+\]
+where \(\widehat R_t(x_t,z)\) is computed on the sampled batch \(B_{t,z}\). To
+write the update rule uniformly, define
+\[
+Y_t(x_t)
+=
+\begin{cases}
+J(x_t), & \text{full-pool mode},\\
+\widehat J_t(x_t), & \text{sampling mode}.
+\end{cases}
+\]
+
+After full-pool evaluation, the newly materialized cluster-level reuse keys are
+\[
+\mathcal M_t(x_t,z)
+=
+\Bigl\{
+(x_{t,1:m},z):
+1\le m\le L,\
+(x_{t,1:m},z)\notin\mathcal E_t
+\Bigr\}.
+\]
+The bipartite reuse graph is updated by
+\[
+\mathcal E_{t+1}
+=
+\mathcal E_t
+\cup
+\bigcup_{z\in\mathcal Z}
+\mathcal M_t(x_t,z).
+\]
+
+Agent-UCT then backpropagates the task reward along the selected path.
+For every visited state-edge pair \((s_m,a_m)\in\tau_t\),
+\[
+N_{t+1}(s_m)
+=
+N_t(s_m)+1,
+\]
+\[
+N_{t+1}(s_m,a_m)
+=
+N_t(s_m,a_m)+1,
+\]
+
+and
+\[
+\hat Q_{t+1}(s_m,a_m)
+=
+\hat Q_t(s_m,a_m)
++
+\frac{
+Y_t(x_t)-\hat Q_t(s_m,a_m)
+}{
+N_{t+1}(s_m,a_m)
+}.
+\]
+Note that the Agent-UCT score is used only for tree selection. \(\hat Q_t\) remains an estimator of the original
+optimization objective, and
+\(-\lambda_t\widehat{\Delta C}_t(s,a)\) acts as a search-time preference for
+branches with stronger prefix reuse.
+
+
+
+
+
+\subsection{Adaptive Item-Level Cost Estimation}
+
+In practice, we adopt sampling to further accelerate the Agent-UCT algorithm.
+In sampling mode, the cluster-level reuse graph \(\mathcal E_t\) is refined by
+an item-level reuse ledger. 
+Let \(\mathcal Q(z)\) denote the fixed question
+pool within cluster \(z\). At iteration \(t\), the sampled batch from
+cluster \(z\) is 
+\[
+B_{t,z}\subseteq\mathcal Q(z).
+\]
+
+The item-level reuse ledger is therefore
+\[
+\mathcal E_t^{Q}
+\subseteq
+\{(p,z,q): p \text{ is a configuration prefix},\ z\in\mathcal Z,\ q\in\mathcal Q(z)\}.
+\]
+The key
+\[
+(p,z,q)\in\mathcal E_t^{Q}
+\]
+means that prefix \(p\) has been materialized for question \(q\) in cluster
+\(z\) before iteration \(t\).
+
+\(\mathcal Q_t(p,z)\subseteq\mathcal Q(z)\) is the set of question ids for which prefix \(p\) has already been materialized before iteration \(t\), defined as
+\[
+\mathcal Q_t(p,z)
+=
+\left\{
+q\in\mathcal Q(z)
+\;\middle|\;
+(p,z,q)\in\mathcal E_t^{Q}
+\right\}.
+\]
+
+
+Let
+\[
+p(s,a)=\mathrm{Child}(s,a).
+\]
+
+
+The expected item-level marginal cost for prefix \(p(s,a)\) on cluster \(z\) is defined as
+\[
+\Delta C_t(s,a;z)
+=
+\mathbb{E}_{q \sim \pi_t(\cdot \mid z)}
+\left[
+c_{d+1}(s,a,z,q)
+\left(
+1 -
+\mathbf{1}
+\left[
+(p(s,a),z,q) \in \mathcal E_t^Q
+\right]
+\right)
+\right].
+\]
+
+The cache hit probability can be approximated as
+\[
+\hat p_t^{\mathrm{hit}}(s,a;z)
+=
+\frac{
+\left|
+\mathcal Q_t(p(s,a),z) \cap B_{t,z}
+\right|
+}{
+|B_{t,z}|
+}.
+\]
+
+Cached questions are counted only when they belong to \(B_{t,z}\).
+
+The expected cache miss probability is
+\[
+\hat p_t^{\mathrm{miss}}(s,a;z)
+=
+1 - \hat p_t^{\mathrm{hit}}(s,a;z).
+\]
+
+
+\[
+\widehat{\Delta C}_t(s,a)
+=
+\sum_{z\in \mathcal Z}
+w_z
+\frac{1}{|B_{t,z}|}
+\sum_{q\in B_{t,z}}
+c_{d+1}(s,a,z,q)
+\left(
+1 -
+\mathbf{1}
+\left[
+(p(s,a),z,q)\in\mathcal E_t^Q
+\right]
+\right).
+\]
+
+
+
+
+
+Note that the cost term is computed once per UCT iteration before evaluation. 
+Additional micro-batches drawn before CL convergence do not affect the cost term within the same iteration; they only update the cache state used in subsequent iterations.
+
+We use a decaying regularization coefficient
+\[
+\lambda_t = \frac{\lambda_0}{\sqrt{t}}, \qquad t>0.
+\]
+
+The cost-aware tree policy then becomes
+\[
+\mathrm{Agent\text{-}UCT}_t(s,a)
+=
+\hat Q_t(s,a)
++
+c_{\mathrm{UCT}}
+\sqrt{
+\frac{\log(N_t(s)+1)}{N_t(s,a)+1}
+}
+-
+\frac{\lambda_0}{\sqrt{t}}
+\widehat{\Delta C}_t(s,a).
+\]
+
+\subsection{Algorithm}
+\newpage
+\begin{algorithm}[t]
+\caption{Sampling-Based Agent-UCT with Item-Level Prefix Reuse}
+\label{alg:reuse-regularized-uct}
+\begin{algorithmic}[1]
+\Statex \textbf{Initialization}
+\State Initialize search tree \(\mathcal T\) with root prefix \(p_{\emptyset}\)
+\State Initialize item-level reuse ledger \(\mathcal E_0^Q\leftarrow\emptyset\)
+\State Initialize cached-question sets \(\mathcal Q_0(p,z)\leftarrow\emptyset\)
+\State Initialize \(x_{\mathrm{best}}\leftarrow\varnothing\), \(J_{\mathrm{best}}\leftarrow-\infty\), \(C_{\mathrm{tot}}\leftarrow0\)
+\newline
+\Statex \textbf{Cache-aware UCT selection}
+\For{\(t=1,\dots,T\)}
+    \State \(\lambda_t\leftarrow\lambda_0/\sqrt t\)
+    \State \(p\leftarrow p_{\emptyset}\)
+    \State Initialize selected prefix path \(\tau_t\leftarrow[p_{\emptyset}]\)
+
+
+    \While{\(p\) is nonterminal and fully expanded in \(\mathcal T\)}
+        \ForAll{child prefixes \(p'\in\mathrm{Children}_{\mathcal T}(p)\)}
+            \State Estimate item-level marginal cost from cache:
+            \[
+            \Delta_{p'}
+            \leftarrow
+            \widehat{\Delta C}^{Q}_t(p';\mathcal E_t^Q,\mathcal Q_t)
+            \]
+            \State Compute child score:
+            \[
+            S_{p'}
+            \leftarrow
+            \hat V_t(p')
+            +
+            c_{\mathrm{UCT}}
+            \sqrt{
+            \frac{\log(N_t(p)+1)}
+            {N_t(p')+1}
+            }
+            -
+            \lambda_t\Delta_{p'}
+            \]
+        \EndFor
+        \State \(p\leftarrow\arg\max_{p'\in\mathrm{Children}_{\mathcal T}(p)} S_{p'}\)
+        \State Append \(p\) to \(\tau_t\)
+    \EndWhile
+
+\Statex \textbf{Expansion}
+    \If{\(p\) is nonterminal}
+        \State Select an unexpanded child prefix \(p'\) of \(p\)
+        \State Add \(p'\) to \(\mathcal T\)
+        \State \(p\leftarrow p'\)
+        \State Append \(p\) to \(\tau_t\)
+    \EndIf
+
+    \State Complete prefix \(p\)  to obtain terminal configuration \(x_t\in\mathcal X\)
+
+\Statex \textbf{Mini-batch reward estimation}
+    \State Initialize mini-batch collection \(\mathfrak B_t\leftarrow\emptyset\)
+    \State Initialize accumulated evaluated questions \(\bar B_{t,z}\leftarrow\emptyset\) for all \(z\in\mathcal Z\)
+    \State Initialize newly materialized keys \(\mathcal M_t^Q\leftarrow\emptyset\)
+    \State Initialize \(\mathrm{CL}_{\mathrm{prev}}\leftarrow+\infty\), \(\mathrm{stable}\leftarrow\mathrm{false}\)
+
+    \Repeat
+        \State Draw mini-batches
+        \[
+        \mathcal B=\{B_z\}_{z\in\mathcal Z},
+        \qquad
+        |B_z|=b
+        \]
+        \State \(\mathfrak B_t\leftarrow\mathfrak B_t\cup\{\mathcal B\}\)
+
+        \State Evaluate \(x_t\) on \(\mathcal B\):
+        \[
+        \left(
+        \widehat J_{\mathfrak B_t}(x_t),
+        \mathcal M_{\mathcal B}^Q,
+        C_{\mathcal B}
+        \right)
+        \leftarrow
+        \mathrm{Eval}(x_t,\mathcal B,\mathcal E_t^Q)
+        \]
+
+        \ForAll{\(z\in\mathcal Z\)}
+            \State \(\bar B_{t,z}\leftarrow\bar B_{t,z}\cup B_z\)
+        \EndFor
+
+        \State \(\mathcal M_t^Q\leftarrow\mathcal M_t^Q\cup\mathcal M_{\mathcal B}^Q\)
+        \State Update running reward estimate \(\widehat J_{\mathfrak B_t}(x_t)\) over \(\{\bar B_{t,z}\}_{z\in\mathcal Z}\)
+        \State Update confidence limit \(\mathrm{CL}_t\) of \(\widehat J_{\mathfrak B_t}(x_t)\)
+        \State \(C_{\mathrm{tot}}\leftarrow C_{\mathrm{tot}}+C_{\mathcal B}\)
+
+        \State \(\mathrm{stable}\leftarrow
+        \bigl(
+        |\mathrm{CL}_t-\mathrm{CL}_{\mathrm{prev}}|
+        \le
+        \epsilon_{\mathrm{CL}}
+        \bigr)\)
+        \State \(\mathrm{CL}_{\mathrm{prev}}\leftarrow\mathrm{CL}_t\)
+
+    \Until{\(\mathrm{stable}\) or \(|\mathfrak B_t|=M_{\max}\) or \((C_{\max}\text{ is set and }C_{\mathrm{tot}}\ge C_{\max})\)}
+
+    \Comment{Cache update}
+    \State \[
+    \mathcal E_{t+1}^Q
+    \leftarrow
+    \mathcal E_t^Q\cup\mathcal M_t^Q
+    \]
+
+    \ForAll{\(z\in\mathcal Z,\ m=1,\dots,L\)}
+        \State
+        \[
+        \mathcal Q_{t+1}(x_{t,1:m},z)
+        \leftarrow
+        \mathcal Q_t(x_{t,1:m},z)\cup\bar B_{t,z}
+        \]
+    \EndFor
+
+    \Comment{Reward backpropagation}
+    \If{\(\widehat J_{\mathfrak B_t}(x_t)>J_{\mathrm{best}}\)}
+        \State \(J_{\mathrm{best}}\leftarrow\widehat J_{\mathfrak B_t}(x_t)\)
+        \State \(x_{\mathrm{best}}\leftarrow x_t\)
+    \EndIf
+
+    \ForAll{prefix nodes \(p_m\in\tau_t\)}
+        \State \(N_{t+1}(p_m)\leftarrow N_t(p_m)+1\)
+        \State
+        \[
+        \hat V_{t+1}(p_m)
+        \leftarrow
+        \hat V_t(p_m)
+        +
+        \frac{
+        \widehat J_{\mathfrak B_t}(x_t)-\hat V_t(p_m)
+        }{
+        N_{t+1}(p_m)
+        }
+        \]
+    \EndFor
+
+    \If{\(C_{\max}\text{ is set and }C_{\mathrm{tot}}\ge C_{\max}\)}
+        \State \textbf{break}
+    \EndIf
+\EndFor
+
+\State \Return \(x_{\mathrm{best}}\)
+\end{algorithmic}
+\end{algorithm}
+\section{Experiment}
+% 定义 Score_t(s,a)=Q+UCB-lambda cost
+
+\section{Discussion and Limitations}
+
+
+\section{Conclusion}
+
+\bibliographystyle{plainnat} 
+\bibliography{agenticOpt}
+
+\section{Appendix}
+
+\end{document}
