@@ -1,44 +1,42 @@
-"""Concrete implementations of ScoreFunction and CostModel.
-
-Provides the only two built-in components the engine ships with:
-  - CostAwareUCTScorer  (paper Section 3.5)
-  - ReuseAwareCostModel (paper Section 3.4)
-"""
+"""Agent-UCT selection score and reuse-aware marginal-cost model."""
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from typing import Hashable
 
-from .interfaces import ClusterDef, CostModel, ScoreFunction, SearchContext, SearchState
+from .interfaces import (
+    ClusterDef,
+    CostModel,
+    ScoreFunction,
+    SearchContext,
+    SearchState,
+)
 
+ItemCostFunction = Callable[
+    [SearchState, Hashable, str, Hashable | None],
+    float,
+]
 
-# ---------------------------------------------------------------------------
-# Scorer
-# ---------------------------------------------------------------------------
 
 class CostAwareUCTScorer(ScoreFunction):
-    r"""Agent-UCT_t(s,a) = Q + c_uct * sqrt(log(N+1)/(n+1)) - (lambda_0/sqrt(t)) * cost
+    r"""Compute the paper's Agent-UCT tree-selection score.
 
     .. math::
 
-        \mathrm{Agent\text{-}UCT}_t(s,a)
-        = \hat Q_t(s,a)
-        + c_{\mathrm{uct}} \sqrt{\frac{\log(N_t(s)+1)}{N_t(s,a)+1}}
-        - \frac{\lambda_0}{\sqrt{t}} \, \widehat{\Delta C}_t(s,a)
+        \widehat Q_t(s,a)
+        + c_{\mathrm{UCT}}
+          \sqrt{\frac{\log(N_t(s)+1)}{N_t(s,a)+1}}
+        - \frac{\lambda_0}{\sqrt{t}}\widehat{\Delta C}_t(s,a)
 
-    Parameters
-    ----------
-    lambda_0 : float
-        Initial cost regularization weight.  Decays as lambda_0/sqrt(t).
-        When 0 this degenerates to vanilla UCT.
-    lambda_t : float
-        Deprecated alias for lambda_0 (backward compat).
+    The cost penalty affects selection only. Rewards stored in tree statistics
+    and the final best configuration are not cost-adjusted.
     """
 
-    def __init__(self, lambda_0: float = 0.0, *, lambda_t: float | None = None) -> None:
-        if lambda_t is not None and lambda_0 == 0.0:
-            lambda_0 = lambda_t
-        self.lambda_0 = lambda_0
+    def __init__(self, lambda_0: float = 0.0) -> None:
+        if lambda_0 < 0:
+            raise ValueError("lambda_0 must be non-negative")
+        self.lambda_0 = float(lambda_0)
 
     def score(
         self,
@@ -49,49 +47,67 @@ class CostAwareUCTScorer(ScoreFunction):
         exploration_constant: float,
         iteration: int = 1,
     ) -> float:
-        exploitation = child_q
+        if parent_visits < 0 or child_visits < 0:
+            raise ValueError("visit counts must be non-negative")
+        if marginal_cost < 0:
+            raise ValueError("marginal_cost must be non-negative")
+        if exploration_constant < 0:
+            raise ValueError("exploration_constant must be non-negative")
+        if iteration < 1:
+            raise ValueError("iteration must be at least 1")
+
         exploration = exploration_constant * math.sqrt(
             math.log(parent_visits + 1) / (child_visits + 1)
         )
-        lambda_t = self.lambda_0 / math.sqrt(max(1, iteration))
-        cost_penalty = lambda_t * marginal_cost
-        return exploitation + exploration - cost_penalty
+        lambda_t = self.lambda_0 / math.sqrt(iteration)
+        return child_q + exploration - lambda_t * marginal_cost
 
-
-# ---------------------------------------------------------------------------
-# Cost model
-# ---------------------------------------------------------------------------
 
 class ReuseAwareCostModel(CostModel):
-    r"""Adaptive item-level marginal cost estimator.
+    r"""Estimate marginal cost from cluster- or item-level reuse keys.
 
-    Computes per-batch hit probability for each spectrum:
+    With ``context.current_batch`` set, this implements the item-level formula
 
     .. math::
 
         \widehat{\Delta C}_t(s,a)
-        = \sum_{z \in \mathcal Z} \omega_z \cdot c_{d+1}(s,a,z) \cdot
-          \left(1 - \frac{|\mathcal Q_t(p(s,a),z) \cap \mathcal{Batch}_z|}
-                         {|\mathcal{Batch}_z|}\right)
+        = \sum_z w_z \frac{1}{|B_{t,z}|}
+          \sum_{q \in B_{t,z}} c_{d+1}(s,a,z,q)
+          \mathbf{1}[(\mathrm{Child}(s,a),z,q) \notin E_t^Q].
 
-    When ``context.extra["current_batches"]`` is populated (adaptive mode),
-    the model computes exact per-batch hit rates against
-    ``context.extra["cached_qids"]``.  Otherwise falls back to the legacy
-    binary Path_t check for backward compatibility.
+    Canonical item-level keys are ``(child_prefix, cluster_id, item_id)``.
+    Without a current batch, the model uses the full-pool cluster-level key
+    ``(child_prefix, cluster_id)``.
 
-    Parameters
-    ----------
-    clusters : list[ClusterDef]
-        Benchmark cluster definitions.  Weights are auto-normalized.
+    ``item_cost`` supplies the domain-specific cost
+    :math:`c_{d+1}(s,a,z,q)`. The default is ``ClusterDef.base_cost``.
     """
 
-    def __init__(self, clusters: list[ClusterDef]) -> None:
-        self.clusters = clusters
-        total_w = sum(c.weight for c in clusters)
-        if total_w > 0:
-            self._norm_weights = [c.weight / total_w for c in clusters]
-        else:
-            self._norm_weights = [1.0 / len(clusters)] * len(clusters)
+    def __init__(
+        self,
+        clusters: list[ClusterDef],
+        item_cost: ItemCostFunction | None = None,
+    ) -> None:
+        if not clusters:
+            raise ValueError("clusters must be non-empty")
+        cluster_ids = [cluster.cluster_id for cluster in clusters]
+        if len(set(cluster_ids)) != len(cluster_ids):
+            raise ValueError("cluster_ids must be unique")
+
+        total_weight = sum(cluster.weight for cluster in clusters)
+        if total_weight <= 0:
+            raise ValueError("at least one cluster weight must be positive")
+
+        self.clusters = tuple(clusters)
+        self._weights = {
+            cluster.cluster_id: cluster.weight / total_weight
+            for cluster in clusters
+        }
+        self._base_costs = {
+            cluster.cluster_id: cluster.base_cost
+            for cluster in clusters
+        }
+        self._item_cost = item_cost or self._default_item_cost
 
     def marginal_cost(
         self,
@@ -99,47 +115,88 @@ class ReuseAwareCostModel(CostModel):
         action: Hashable,
         context: SearchContext,
     ) -> float:
-        key_fn = getattr(state, "path_key_for_action", None)
-        if key_fn is None:
-            return sum(
-                w * c.base_cost
-                for w, c in zip(self._norm_weights, self.clusters)
+        child_prefix = state.child(action).state_key()
+        batch = context.current_batch
+        if batch is None:
+            return self._cluster_level_cost(
+                state,
+                action,
+                child_prefix,
+                context,
             )
-        prefix = key_fn(action)
 
-        current_batches = context.extra.get("current_batches")
-        if current_batches is not None:
-            return self._adaptive_cost(prefix, context, current_batches)
+        batch_cluster_ids = {cluster.cluster_id for cluster in batch.clusters}
+        expected_cluster_ids = {cluster.cluster_id for cluster in self.clusters}
+        if batch_cluster_ids != expected_cluster_ids:
+            missing = sorted(expected_cluster_ids - batch_cluster_ids)
+            extra = sorted(batch_cluster_ids - expected_cluster_ids)
+            raise ValueError(
+                "current_batch clusters must match the cost-model clusters; "
+                f"missing={missing}, extra={extra}"
+            )
 
-        # Legacy fallback: binary Path_t check
-        cost = 0.0
-        for w, c in zip(self._norm_weights, self.clusters):
-            bipartite_key = (prefix, c.cluster_id)
-            if bipartite_key not in context.materialized_keys:
-                cost += w * c.base_cost
-        return cost
+        total = 0.0
+        for cluster in self.clusters:
+            cluster_batch = batch.for_cluster(cluster.cluster_id)
+            assert cluster_batch is not None
+            uncached_cost = 0.0
+            for item_id in cluster_batch.item_ids:
+                reuse_key = (child_prefix, cluster.cluster_id, item_id)
+                if reuse_key in context.materialized_keys:
+                    continue
+                uncached_cost += self._validated_item_cost(
+                    state,
+                    action,
+                    cluster.cluster_id,
+                    item_id,
+                )
+            total += (
+                self._weights[cluster.cluster_id]
+                * uncached_cost
+                / len(cluster_batch.item_ids)
+            )
+        return total
 
-    def _adaptive_cost(
+    def _cluster_level_cost(
         self,
-        prefix: Hashable,
+        state: SearchState,
+        action: Hashable,
+        child_prefix: Hashable,
         context: SearchContext,
-        current_batches: dict[str, list[str]],
     ) -> float:
-        """Per-batch hit probability cost: cost_z = base_cost * (1 - hit_prob)."""
-        cached_qids = context.extra.get("cached_qids", {})
-        cost = 0.0
-        for w, c in zip(self._norm_weights, self.clusters):
-            sid = c.cluster_id
-            batch_z = current_batches.get(sid)
-            if not batch_z:
-                cost += w * c.base_cost
+        total = 0.0
+        for cluster in self.clusters:
+            reuse_key = (child_prefix, cluster.cluster_id)
+            if reuse_key in context.materialized_keys:
                 continue
-            cached_z = cached_qids.get((prefix, sid))
-            if cached_z:
-                batch_set = set(batch_z)
-                hit_count = len(cached_z & batch_set)
-                hit_prob = hit_count / len(batch_z)
-            else:
-                hit_prob = 0.0
-            cost += w * c.base_cost * (1.0 - hit_prob)
+            total += self._weights[cluster.cluster_id] * self._validated_item_cost(
+                state,
+                action,
+                cluster.cluster_id,
+                None,
+            )
+        return total
+
+    def _default_item_cost(
+        self,
+        _state: SearchState,
+        _action: Hashable,
+        cluster_id: str,
+        _item_id: Hashable | None,
+    ) -> float:
+        return self._base_costs[cluster_id]
+
+    def _validated_item_cost(
+        self,
+        state: SearchState,
+        action: Hashable,
+        cluster_id: str,
+        item_id: Hashable | None,
+    ) -> float:
+        cost = float(self._item_cost(state, action, cluster_id, item_id))
+        if not math.isfinite(cost) or cost < 0:
+            raise ValueError(
+                "item_cost must return a finite, non-negative value; "
+                f"got {cost!r} for cluster={cluster_id!r}, item={item_id!r}"
+            )
         return cost

@@ -5,7 +5,7 @@ that the engine maintains during search.
 """
 from __future__ import annotations
 
-from typing import Any, Hashable, Optional
+from typing import Hashable
 
 from .interfaces import SearchState
 
@@ -25,16 +25,14 @@ class TreeNode:
         "children",
         "visit_count",
         "value_sum",
-        "best_value",
-        "metadata",
         "_available_actions_cache",
     )
 
     def __init__(
         self,
         state: SearchState,
-        parent: Optional["TreeNode"] = None,
-        action_from_parent: Optional[Hashable] = None,
+        parent: "TreeNode | None" = None,
+        action_from_parent: Hashable | None = None,
     ) -> None:
         self.state = state
         self.parent = parent
@@ -42,9 +40,7 @@ class TreeNode:
         self.children: dict[Hashable, "TreeNode"] = {}
         self.visit_count: int = 0
         self.value_sum: float = 0.0
-        self.best_value: float = float("-inf")
-        self.metadata: dict[str, Any] = {}
-        self._available_actions_cache: Optional[list[Hashable]] = None
+        self._available_actions_cache: list[Hashable] | None = None
 
     # -- properties -----------------------------------------------------------
 
@@ -73,8 +69,6 @@ class TreeNode:
     def update(self, reward: float) -> None:
         self.visit_count += 1
         self.value_sum += reward
-        if reward > self.best_value:
-            self.best_value = reward
 
     def __repr__(self) -> str:
         return (

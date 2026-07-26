@@ -1,10 +1,12 @@
-"""uct_engine -- lightweight cost-aware UCT for discrete compositional search."""
+"""Standalone Agent-UCT search core."""
 
 from .core import TreeNode
 from .interfaces import (
-    BenchmarkClusterResult,
+    BatchProvider,
+    ClusterBatch,
     ClusterDef,
     CostModel,
+    EvaluationBatch,
     EvaluationResult,
     Evaluator,
     ScoreFunction,
@@ -12,22 +14,24 @@ from .interfaces import (
     SearchResult,
     SearchState,
 )
-from .scoring import CostAwareUCTScorer, ReuseAwareCostModel
+from .scoring import CostAwareUCTScorer, ItemCostFunction, ReuseAwareCostModel
 from .search import (
     IterationRecord,
     OnIterationCallback,
     UCTSearchEngine,
     random_rollout,
-    update_cached_qids,
 )
 
 __all__ = [
-    "BenchmarkClusterResult",
+    "BatchProvider",
+    "ClusterBatch",
     "ClusterDef",
     "CostAwareUCTScorer",
     "CostModel",
+    "EvaluationBatch",
     "EvaluationResult",
     "Evaluator",
+    "ItemCostFunction",
     "IterationRecord",
     "OnIterationCallback",
     "ReuseAwareCostModel",
@@ -38,5 +42,4 @@ __all__ = [
     "TreeNode",
     "UCTSearchEngine",
     "random_rollout",
-    "update_cached_qids",
 ]

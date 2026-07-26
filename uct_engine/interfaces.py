@@ -1,7 +1,9 @@
-"""Protocol and ABC definitions for the UCT search engine.
+"""Public contracts for the standalone Agent-UCT search core.
 
-Defines the extension points: SearchState, Evaluator, CostModel, ScoreFunction,
-and the data structures that flow between them.
+The core knows about configuration states, an optional per-iteration benchmark
+batch, scalar rewards/costs, and materialized reuse keys. Dataset loading,
+adaptive stopping rules, workflow execution, and physical cache backends belong
+to the experiment integration layer.
 """
 from __future__ import annotations
 
@@ -11,141 +13,155 @@ from dataclasses import dataclass, field
 from typing import Any, Hashable, Protocol, runtime_checkable
 
 
-# ---------------------------------------------------------------------------
-# SearchState protocol
-# ---------------------------------------------------------------------------
-
 @runtime_checkable
 class SearchState(Protocol):
-    """A partially selected configuration in the search tree.
-
-    Users implement this for their domain (e.g. RAG pipeline slots).
-    The engine never assumes what the state contains internally.
-    """
+    """A partial or complete configuration in the search tree."""
 
     def is_terminal(self) -> bool:
-        """True when all slots are filled (complete configuration)."""
+        """Return whether the configuration is complete."""
         ...
 
     def available_actions(self) -> list[Hashable]:
-        """Actions that extend this partial config by one slot."""
+        """Return actions that extend this configuration by one level."""
         ...
 
     def child(self, action: Hashable) -> "SearchState":
-        """Return a new state with *action* appended."""
+        """Return the child configuration selected by ``action``."""
         ...
 
     def state_key(self) -> Hashable:
-        """Content-addressable key uniquely identifying this state."""
+        """Return a stable, hashable key for this configuration prefix."""
         ...
 
     def pretty(self) -> str:
-        """Human-readable representation."""
+        """Return a human-readable representation."""
         ...
 
 
-# ---------------------------------------------------------------------------
-# Evaluation data structures (benchmark-cluster oriented)
-# ---------------------------------------------------------------------------
-
-@dataclass
+@dataclass(frozen=True)
 class ClusterDef:
-    """Definition of a benchmark cluster for cost modelling.
+    """Benchmark-cluster weight and default one-step execution cost."""
 
-    Used by ReuseAwareCostModel to compute per-cluster marginal cost
-    with bipartite (prefix, cluster_id) reuse keys.
-    """
     cluster_id: str
     weight: float = 1.0
     base_cost: float = 1.0
 
+    def __post_init__(self) -> None:
+        if not self.cluster_id:
+            raise ValueError("cluster_id must be non-empty")
+        if self.weight < 0:
+            raise ValueError("cluster weight must be non-negative")
+        if self.base_cost < 0:
+            raise ValueError("cluster base_cost must be non-negative")
 
-@dataclass
-class BenchmarkClusterResult:
-    """Result from evaluating one configuration on one benchmark cluster.
 
-    Maps to the paper's per-cluster reward R_hat(x, z) and the path
-    prefixes materialized during that evaluation.
-    """
+@dataclass(frozen=True)
+class ClusterBatch:
+    """Canonical item identifiers sampled from one benchmark cluster."""
+
     cluster_id: str
-    reward: float
-    cost: float = 0.0
-    materialized_keys: list[Hashable] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    item_ids: tuple[Hashable, ...]
+
+    def __post_init__(self) -> None:
+        if not self.cluster_id:
+            raise ValueError("cluster_id must be non-empty")
+        if not self.item_ids:
+            raise ValueError("a cluster batch must contain at least one item")
+        if len(set(self.item_ids)) != len(self.item_ids):
+            raise ValueError("item_ids must be unique within a cluster batch")
+
+
+@dataclass(frozen=True)
+class EvaluationBatch:
+    """The paper-defined initial batch ``B_t`` for one Agent-UCT iteration."""
+
+    clusters: tuple[ClusterBatch, ...]
+
+    def __post_init__(self) -> None:
+        cluster_ids = [batch.cluster_id for batch in self.clusters]
+        if not cluster_ids:
+            raise ValueError("an evaluation batch must contain at least one cluster")
+        if len(set(cluster_ids)) != len(cluster_ids):
+            raise ValueError("cluster_ids must be unique within an evaluation batch")
+
+    def for_cluster(self, cluster_id: str) -> ClusterBatch | None:
+        """Return the batch for ``cluster_id`` if it is active this iteration."""
+        return next(
+            (batch for batch in self.clusters if batch.cluster_id == cluster_id),
+            None,
+        )
 
 
 @dataclass
 class EvaluationResult:
-    """Aggregated result from evaluating across a cluster minibatch.
+    """Scalar search outcome and the reuse keys materialized by evaluation."""
 
-    *reward* is the weighted aggregate J_hat(x).
-    *cluster_results* carries per-cluster detail so the engine can
-    harvest materialized_keys for the reuse graph.
-    """
     reward: float
     total_cost: float = 0.0
-    cluster_results: list[BenchmarkClusterResult] = field(default_factory=list)
+    materialized_keys: set[Hashable] = field(default_factory=set)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# SearchContext -- mutable state carried through one search() call
-# ---------------------------------------------------------------------------
-
 @dataclass
 class SearchContext:
-    """Mutable bag of search-session state.
+    """Mutable state shared by one search run.
 
-    *materialized_keys* maps directly to the paper's Path_t -- the set
-    of (path-prefix, cluster) pairs already cached.
+    ``current_batch`` is drawn exactly once at the start of an iteration. The
+    cost model and evaluator observe the same object. ``materialized_keys`` is
+    the logical view of the execution substrate's reuse graph.
     """
+
     materialized_keys: set[Hashable] = field(default_factory=set)
+    current_batch: EvaluationBatch | None = None
     total_cost: float = 0.0
     total_evaluations: int = 0
     random: random.Random = field(default_factory=lambda: random.Random(0))
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# SearchResult -- returned by engine.search()
-# ---------------------------------------------------------------------------
-
 @dataclass
 class SearchResult:
-    """Outcome of a completed UCT search run."""
-    best_state: Any  # SearchState
+    """Outcome of a completed Agent-UCT search."""
+
+    best_state: SearchState | None
     best_reward: float
-    root_node: Any  # TreeNode
+    root_node: Any
     iterations: int
     total_evaluations: int
     total_cost: float
     context: SearchContext
 
 
-# ---------------------------------------------------------------------------
-# Abstract base classes for pluggable components
-# ---------------------------------------------------------------------------
+class BatchProvider(ABC):
+    """Draw the initial benchmark batch before tree selection."""
+
+    @abstractmethod
+    def draw(self, iteration: int, context: SearchContext) -> EvaluationBatch:
+        """Return the single batch used by cost estimation and evaluation."""
+        ...
+
 
 class Evaluator(ABC):
-    """Evaluates a terminal (or rolled-out) configuration.
+    """Evaluate a completed configuration.
 
-    Implementations are responsible for:
-      1. Optionally sampling a benchmark cluster minibatch.
-      2. Running evaluation per cluster.
-      3. Returning BenchmarkClusterResult objects inside EvaluationResult.
-      4. Populating materialized_keys so the engine can update Path_t.
+    When ``context.current_batch`` is present, implementations must evaluate
+    that initial batch rather than draw a replacement. They may extend it with
+    additional micro-batches according to an integration-owned stopping rule.
+    Only keys physically or logically materialized by the evaluation should be
+    returned in ``EvaluationResult.materialized_keys``.
     """
 
     @abstractmethod
-    def evaluate(self, state: SearchState, context: SearchContext) -> EvaluationResult:
+    def evaluate(
+        self,
+        state: SearchState,
+        context: SearchContext,
+    ) -> EvaluationResult:
         ...
 
 
 class CostModel(ABC):
-    """Estimates the marginal cost of expanding *state* by *action*.
-
-    The cost may depend on the current search history via *context*.
-    """
+    """Estimate the history-dependent marginal cost of one child prefix."""
 
     @abstractmethod
     def marginal_cost(
@@ -158,11 +174,7 @@ class CostModel(ABC):
 
 
 class ScoreFunction(ABC):
-    """Computes the selection score for a child node during tree descent.
-
-    Receives pre-computed numeric stats so implementations stay pure
-    functions on numbers.
-    """
+    """Compute a tree-selection score for one child."""
 
     @abstractmethod
     def score(

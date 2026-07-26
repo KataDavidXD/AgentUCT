@@ -5,7 +5,6 @@ import unittest
 from typing import Hashable
 
 from uct_engine import (
-    BenchmarkClusterResult,
     ClusterDef,
     CostAwareUCTScorer,
     EvaluationResult,
@@ -38,6 +37,7 @@ class LeastVisitedScorer(ScoreFunction):
         child_q: float,
         marginal_cost: float,
         exploration_constant: float,
+        iteration: int = 1,
     ) -> float:
         self._call_count += 1
         return 1_000_000.0 / (child_visits + 1)
@@ -102,7 +102,7 @@ class TestCustomScorer(unittest.TestCase):
         """Standard CostAwareUCTScorer should converge to gamma (reward 0.9)."""
         engine = UCTSearchEngine(
             evaluator=OneSlotEvaluator(),
-            scorer=CostAwareUCTScorer(lambda_t=0.0),
+            scorer=CostAwareUCTScorer(lambda_0=0.0),
             cost_model=ReuseAwareCostModel(clusters=ZERO_COST_CLUSTER),
             exploration_constant=1.4,
             random_seed=7,

@@ -5,7 +5,6 @@ import unittest
 from typing import Hashable
 
 from uct_engine import (
-    BenchmarkClusterResult,
     ClusterDef,
     CostAwareUCTScorer,
     EvaluationResult,
@@ -65,9 +64,6 @@ class TinyEvaluator(Evaluator):
         return EvaluationResult(
             reward=reward,
             total_cost=1.0,
-            cluster_results=[
-                BenchmarkClusterResult(cluster_id="c0", reward=reward, cost=1.0),
-            ],
         )
 
 
@@ -78,7 +74,7 @@ class TestBasicSearch(unittest.TestCase):
     def _run_search(self, iterations: int = 80) -> SearchResult:
         engine = UCTSearchEngine(
             evaluator=TinyEvaluator(),
-            scorer=CostAwareUCTScorer(lambda_t=0.0),
+            scorer=CostAwareUCTScorer(lambda_0=0.0),
             cost_model=ReuseAwareCostModel(clusters=SINGLE_CLUSTER),
             exploration_constant=1.4,
             random_seed=123,
@@ -110,13 +106,13 @@ class TestBasicSearch(unittest.TestCase):
     def test_cost_budget_stops_early(self) -> None:
         engine = UCTSearchEngine(
             evaluator=TinyEvaluator(),
-            scorer=CostAwareUCTScorer(lambda_t=0.0),
+            scorer=CostAwareUCTScorer(lambda_0=0.0),
             cost_model=ReuseAwareCostModel(clusters=SINGLE_CLUSTER),
             exploration_constant=1.4,
             random_seed=99,
         )
         result = engine.search(TinyState(), max_iterations=1000, max_cost=5.0)
-        self.assertLessEqual(result.total_cost, 6.0)
+        self.assertLessEqual(result.total_cost, 5.0)
         self.assertLess(result.iterations, 1000)
 
 
