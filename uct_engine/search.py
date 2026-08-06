@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Hashable
 
@@ -43,6 +43,93 @@ class IterationRecord:
     best_state: SearchState
     best_reward: float
     evaluation_metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RootChildSeed:
+    """One already-evaluated rollout used to seed a root child.
+
+    ``action_path`` is replayed from the search root before any tree statistics
+    are initialized.  Omitting it is valid only when the evaluated terminal
+    state is the direct child selected by ``action``.
+    """
+
+    action: Hashable
+    evaluated_state: SearchState
+    reward: float
+    action_path: tuple[Hashable, ...] | None = None
+
+    def __post_init__(self) -> None:
+        path = (
+            (self.action,)
+            if self.action_path is None
+            else tuple(self.action_path)
+        )
+        if not path:
+            raise ValueError("root-child seed action_path must not be empty")
+        if path[0] != self.action:
+            raise ValueError(
+                "root-child seed action_path must start with its root action"
+            )
+        object.__setattr__(self, "action_path", path)
+
+
+def _is_finite_non_negative_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(normalized) and normalized >= 0
+
+
+@dataclass(frozen=True)
+class WarmStartBundle:
+    """Atomically couple a warmed ledger with its evaluated root rollouts.
+
+    Integrations may perform extra pre-loop bookkeeping, so the context can
+    report more evaluations than there are root-child seeds.  It can never
+    report fewer: every seeded visit/Q value must have a corresponding
+    evaluation in the shared ledger.
+    """
+
+    context: SearchContext
+    root_child_seeds: tuple[RootChildSeed, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.context, SearchContext):
+            raise TypeError("warm-start context must be a SearchContext")
+        object.__setattr__(
+            self,
+            "root_child_seeds",
+            tuple(self.root_child_seeds),
+        )
+        self.validate()
+
+    def validate(self) -> None:
+        seed_count = len(self.root_child_seeds)
+        if seed_count == 0:
+            raise ValueError("warm start requires at least one root-child seed")
+        total_cost = self.context.total_cost
+        if not _is_finite_non_negative_number(total_cost):
+            raise ValueError(
+                "warm-start context total_cost must be finite and non-negative"
+            )
+        total_evaluations = self.context.total_evaluations
+        if (
+            isinstance(total_evaluations, bool)
+            or not isinstance(total_evaluations, int)
+            or total_evaluations < 0
+        ):
+            raise ValueError(
+                "warm-start context total_evaluations must be a non-negative integer"
+            )
+        if total_evaluations < seed_count:
+            raise ValueError(
+                "warm-start context total_evaluations must be at least "
+                f"the root-child seed count ({seed_count})"
+            )
 
 
 OnIterationCallback = Callable[[IterationRecord], None]
@@ -89,8 +176,15 @@ class UCTSearchEngine:
         max_iterations: int = 200,
         max_cost: float | None = None,
         on_iteration: OnIterationCallback | None = None,
+        *,
+        warm_start: WarmStartBundle | None = None,
     ) -> SearchResult:
-        """Search from ``root_state``.
+        """Search from ``root_state``, optionally using an atomic warm start.
+
+        ``warm_start`` couples the pre-materialized context to the root-child
+        rollouts that produced its initial tree statistics.  Integrations
+        cannot seed Q/visits without supplying the matching ledger, or supply
+        a warm ledger without the matching seeds.
 
         ``max_cost`` is checked before a new iteration and after each atomic
         evaluation. An individual evaluation may therefore cross the boundary;
@@ -98,14 +192,24 @@ class UCTSearchEngine:
         """
         if max_iterations < 0:
             raise ValueError("max_iterations must be non-negative")
-        if max_cost is not None and max_cost < 0:
-            raise ValueError("max_cost must be non-negative")
+        if max_cost is not None and not _is_finite_non_negative_number(max_cost):
+            raise ValueError("max_cost must be finite and non-negative")
 
-        rng = random.Random(self.random_seed)
-        context = SearchContext(random=rng)
+        if warm_start is None:
+            context = SearchContext(random=random.Random(self.random_seed))
+            root_child_seeds: tuple[RootChildSeed, ...] = ()
+        else:
+            if not isinstance(warm_start, WarmStartBundle):
+                raise TypeError("warm_start must be a WarmStartBundle")
+            warm_start.validate()
+            context = warm_start.context
+            root_child_seeds = warm_start.root_child_seeds
+
+        rng = context.random
         root = TreeNode(state=root_state)
-        best_state: SearchState | None = None
-        best_reward = float("-inf")
+        best_state, best_reward = self._apply_root_child_seeds(
+            root, root_child_seeds
+        )
         iterations_completed = 0
 
         for iteration in range(1, max_iterations + 1):
@@ -186,6 +290,76 @@ class UCTSearchEngine:
             total_cost=context.total_cost,
             context=context,
         )
+
+    @classmethod
+    def _apply_root_child_seeds(
+        cls,
+        root: TreeNode,
+        seeds: Sequence[RootChildSeed],
+    ) -> tuple[SearchState | None, float]:
+        """Create seeded root children and backpropagate their raw rewards."""
+        if not seeds:
+            return None, float("-inf")
+        if root.state.is_terminal():
+            raise ValueError("cannot seed root children of a terminal state")
+
+        available_actions = root.state.available_actions()
+        seen_actions: set[Hashable] = set()
+        best_state: SearchState | None = None
+        best_reward = float("-inf")
+        for seed in seeds:
+            if seed.action in seen_actions:
+                raise ValueError(
+                    f"duplicate root-child seed action: {seed.action!r}"
+                )
+            if seed.action not in available_actions:
+                raise ValueError(
+                    f"unknown root-child seed action: {seed.action!r}"
+                )
+            if not seed.evaluated_state.is_terminal():
+                raise ValueError("root-child seed evaluated_state must be terminal")
+            replayed_state = root.state
+            child_state: SearchState | None = None
+            assert seed.action_path is not None
+            for index, action in enumerate(seed.action_path):
+                if (
+                    replayed_state.is_terminal()
+                    or action not in replayed_state.available_actions()
+                ):
+                    raise ValueError(
+                        "root-child seed action_path does not reproduce "
+                        "evaluated_state from its root edge"
+                    )
+                replayed_state = replayed_state.child(action)
+                if index == 0:
+                    child_state = replayed_state
+            if (
+                not replayed_state.is_terminal()
+                or replayed_state.state_key()
+                != seed.evaluated_state.state_key()
+            ):
+                raise ValueError(
+                    "root-child seed action_path does not reproduce "
+                    "evaluated_state from its root edge"
+                )
+            assert child_state is not None
+            reward = float(seed.reward)
+            if not math.isfinite(reward):
+                raise ValueError(
+                    f"root-child seed reward must be finite: {seed.reward!r}"
+                )
+
+            child = root.add_child(
+                seed.action,
+                child_state,
+            )
+            cls._backpropagate(child, reward)
+            seen_actions.add(seed.action)
+            if reward > best_reward:
+                best_state = seed.evaluated_state
+                best_reward = reward
+
+        return best_state, best_reward
 
     def _select(
         self,

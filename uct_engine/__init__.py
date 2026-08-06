@@ -18,7 +18,9 @@ from .scoring import CostAwareUCTScorer, ItemCostFunction, ReuseAwareCostModel
 from .search import (
     IterationRecord,
     OnIterationCallback,
+    RootChildSeed,
     UCTSearchEngine,
+    WarmStartBundle,
     random_rollout,
 )
 
@@ -35,11 +37,13 @@ __all__ = [
     "IterationRecord",
     "OnIterationCallback",
     "ReuseAwareCostModel",
+    "RootChildSeed",
     "ScoreFunction",
     "SearchContext",
     "SearchResult",
     "SearchState",
     "TreeNode",
     "UCTSearchEngine",
+    "WarmStartBundle",
     "random_rollout",
 ]
