@@ -1,5 +1,6 @@
 """Standalone Agent-UCT search core."""
 
+from .checkpoint import CheckpointCodec, SearchCheckpoint
 from .core import TreeNode
 from .interfaces import (
     BatchProvider,
@@ -16,9 +17,16 @@ from .interfaces import (
 )
 from .scoring import CostAwareUCTScorer, ItemCostFunction, ReuseAwareCostModel
 from .search import (
+    BackpropagationAudit,
+    CacheCostAudit,
+    IterationAlgorithmAudit,
     IterationRecord,
+    OnCheckpointCallback,
     OnIterationCallback,
+    RandomChoiceAudit,
     RootChildSeed,
+    SelectionCandidateAudit,
+    SelectionStepAudit,
     UCTSearchEngine,
     WarmStartBundle,
     random_rollout,
@@ -26,6 +34,9 @@ from .search import (
 
 __all__ = [
     "BatchProvider",
+    "BackpropagationAudit",
+    "CacheCostAudit",
+    "CheckpointCodec",
     "ClusterBatch",
     "ClusterDef",
     "CostAwareUCTScorer",
@@ -35,11 +46,17 @@ __all__ = [
     "Evaluator",
     "ItemCostFunction",
     "IterationRecord",
+    "IterationAlgorithmAudit",
+    "OnCheckpointCallback",
     "OnIterationCallback",
+    "RandomChoiceAudit",
     "ReuseAwareCostModel",
     "RootChildSeed",
+    "SelectionCandidateAudit",
+    "SelectionStepAudit",
     "ScoreFunction",
     "SearchContext",
+    "SearchCheckpoint",
     "SearchResult",
     "SearchState",
     "TreeNode",

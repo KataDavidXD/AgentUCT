@@ -25,6 +25,7 @@ class TreeNode:
         "children",
         "visit_count",
         "value_sum",
+        "best_value",
         "_available_actions_cache",
     )
 
@@ -40,6 +41,7 @@ class TreeNode:
         self.children: dict[Hashable, "TreeNode"] = {}
         self.visit_count: int = 0
         self.value_sum: float = 0.0
+        self.best_value: float = float("-inf")
         self._available_actions_cache: list[Hashable] | None = None
 
     # -- properties -----------------------------------------------------------
@@ -69,6 +71,7 @@ class TreeNode:
     def update(self, reward: float) -> None:
         self.visit_count += 1
         self.value_sum += reward
+        self.best_value = max(self.best_value, reward)
 
     def __repr__(self) -> str:
         return (

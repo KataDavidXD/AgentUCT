@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import unittest
 from typing import Hashable
 
@@ -199,6 +200,97 @@ class TestRolloutCacheSemantics(unittest.TestCase):
         # evaluation does not trigger a same-iteration score recomputation.
         self.assertEqual(evaluator.cost_call_counts_at_entry, [0, 1, 3])
         self.assertEqual(cost_call_counts_after_iteration, [0, 1, 3])
+
+        # Every callback carries a payload-free algorithm audit.  The first
+        # iteration stops tree selection at the root, expands ``a``, and keeps
+        # the random ``b/c`` completion outside the tree.
+        first_audit = records[0].algorithm_audit
+        self.assertIsNotNone(first_audit)
+        assert first_audit is not None
+        self.assertEqual(first_audit.tree_selection_path, ())
+        self.assertEqual(first_audit.expanded_action, "a")
+        self.assertEqual(first_audit.tree_evaluation_path, ("a",))
+        self.assertEqual(first_audit.rollout_actions, ("b", "c"))
+        self.assertEqual(first_audit.expansion_candidates, ("a",))
+        self.assertEqual(
+            [choice.state_path for choice in first_audit.rollout_choices],
+            [("a",), ("a", "b")],
+        )
+        self.assertEqual(
+            [choice.candidates for choice in first_audit.rollout_choices],
+            [("b",), ("c",)],
+        )
+        self.assertEqual(
+            [choice.chosen_action for choice in first_audit.rollout_choices],
+            ["b", "c"],
+        )
+        self.assertEqual(first_audit.selection_steps, ())
+        self.assertEqual(first_audit.batch_cluster_sizes, (("z", 1),))
+        self.assertEqual(
+            [item.node_path for item in first_audit.backpropagation],
+            [("a",), ()],
+        )
+        self.assertEqual(
+            [item.before_visits for item in first_audit.backpropagation],
+            [0, 0],
+        )
+        self.assertEqual(
+            [item.after_visits for item in first_audit.backpropagation],
+            [1, 1],
+        )
+        self.assertEqual(first_audit.cache_cost.materialized_keys_at_selection, 0)
+        self.assertEqual(first_audit.cache_cost.materialized_keys_reported, 3)
+        self.assertEqual(first_audit.cache_cost.materialized_keys_added, 3)
+        self.assertEqual(first_audit.cache_cost.materialized_keys_after_merge, 3)
+
+        # Once the root is fully expanded, every candidate's exact UCT inputs,
+        # score, cache-dependent delta cost, and selected edge are retained.
+        second_audit = records[1].algorithm_audit
+        self.assertIsNotNone(second_audit)
+        assert second_audit is not None
+        self.assertEqual(second_audit.tree_selection_path, ("a",))
+        self.assertEqual(len(second_audit.selection_steps), 1)
+        root_step = second_audit.selection_steps[0]
+        self.assertEqual(root_step.parent_path, ())
+        self.assertEqual(root_step.parent_visits, 1)
+        self.assertEqual(root_step.parent_q, 1.0)
+        self.assertEqual(root_step.selected_action, "a")
+        self.assertEqual(len(root_step.candidates), 1)
+        candidate = root_step.candidates[0]
+        self.assertEqual(candidate.action, "a")
+        self.assertTrue(candidate.selected)
+        self.assertEqual(candidate.child_visits, 1)
+        self.assertEqual(candidate.child_q, 1.0)
+        self.assertEqual(candidate.marginal_cost, 1.0)
+        self.assertTrue(math.isfinite(candidate.score))
+        self.assertEqual(
+            second_audit.cache_cost.materialized_keys_at_selection,
+            3,
+        )
+        self.assertEqual(
+            second_audit.cache_cost.materialized_keys_before_merge,
+            3,
+        )
+        self.assertEqual(second_audit.cache_cost.materialized_keys_added, 3)
+        self.assertEqual(second_audit.cache_cost.materialized_keys_after_merge, 6)
+
+        third_audit = records[2].algorithm_audit
+        self.assertIsNotNone(third_audit)
+        assert third_audit is not None
+        self.assertEqual(len(third_audit.selection_steps), 2)
+        self.assertEqual(
+            [step.selected_action for step in third_audit.selection_steps],
+            ["a", "b"],
+        )
+        self.assertEqual(
+            [
+                candidate.marginal_cost
+                for step in third_audit.selection_steps
+                for candidate in step.candidates
+            ],
+            [0.0, 0.0],
+        )
+        self.assertEqual(third_audit.cache_cost.materialized_keys_added, 0)
 
 
 if __name__ == "__main__":
