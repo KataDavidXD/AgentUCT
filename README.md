@@ -1,150 +1,207 @@
 # agent-uct
 
-> Anonymous submission artifact. Identity-bearing links and attribution are
-> intentionally omitted during double-blind review.
+`agent-uct` is a research-oriented Python algorithm package implementing
+reuse-aware UCT for discrete, compositional workflow search. RAG is the leading
+case; the broader method applies to workflows whose evaluated prefixes can be
+reused. The package owns the search policy, while datasets, execution,
+checkpoint storage, and reward computation stay in the caller's integration
+layer.
 
-`agent-uct` is the standalone algorithm core for reuse-aware UCT over discrete,
-compositional workflow configurations. The full RAG experiments were run in the
-separate OminiRAG/RAGSpace artifact; this repository intentionally does not
-duplicate that experiment stack.
+## Why agent-uct
 
-## Method
+Ordinary UCT treats every candidate evaluation as equally expensive. Agent-UCT
+keeps raw task reward as its optimization target while adding a decaying
+marginal-cost penalty to tree selection. Integrations can therefore expose real
+reuse without coupling the search core to one RAG stack or execution backend.
 
-At iteration `t`, Agent-UCT selects an action with
+## How the method works
 
-```text
-score_t(s, a)
-  = Q_t(s, a)
-  + c_uct * sqrt(log(N_t(s) + 1) / (N_t(s, a) + 1))
-  - (lambda_0 / sqrt(t)) * marginal_cost_t(s, a)
-```
-
-The cost term changes the tree policy only. Tree statistics, backpropagation,
-and the final best configuration use the raw task reward, not
-`reward - cost`.
-
-In sampling mode, the marginal-cost estimate is
+At iteration `t`, the engine scores a child with:
 
 ```text
-sum_z w_z / |B_t,z|
-  * sum_{q in B_t,z}
-      c(s, a, z, q)
-      * 1[(child_prefix, z, q) is not materialized]
+Q(s, a)
++ c_uct * sqrt(log(N(s) + 1) / (N(s, a) + 1))
+- (lambda_0 / sqrt(t)) * marginal_cost(s, a)
 ```
 
-The package uses the canonical item key
-`(child_prefix, cluster_id, item_id)`. Full-pool mode uses the cluster-level key
-`(child_prefix, cluster_id)`.
+The cost term changes selection only. Evaluation, backpropagation, and final
+best-state selection use the evaluator's finite raw reward.
 
-## Exact scope
-
-The core owns:
-
-- the prefix search tree and visit/Q statistics;
-- one optional initial batch `B_t` drawn before selection;
-- selection, expansion, random completion, and raw-reward backpropagation;
-- the `lambda_0 / sqrt(t)` schedule;
-- logical reuse-key updates reported by the evaluator;
-- iteration and atomic-evaluation cost limits.
-
-The experiment integration owns:
-
-- RAG components, prompts, datasets, spectra, and validity constraints;
-- canonical source QIDs and batch contents;
-- sequential sampling and the definition of SE/CL stopping;
-- reward aggregation and physical cost calibration;
-- WTB/AgentGit execution, checkpoints, replay, SQLite ledgers, and VDB caches;
-- resume, concurrency, logging, baselines, ablations, and result analysis.
-
-This separation is deliberate. WTB can make a logical reuse key correspond to a
-restorable workflow prefix, but WTB is an execution backend rather than part of
-the Agent-UCT tree policy.
-
-## Iteration contract
-
-1. An optional `BatchProvider` draws one `EvaluationBatch`.
-2. The engine stores that exact object in `SearchContext.current_batch`.
-3. The `CostModel` reads it during tree selection.
-4. The `Evaluator` evaluates the same initial batch. It must not replace it
-   with a separately sampled batch.
-5. The evaluator may add integration-defined micro-batches, but they cannot
-   retroactively change the current iteration's selection cost.
-6. Only keys returned in `EvaluationResult.materialized_keys` enter the reuse
-   graph. The core never fabricates prefix/QID hits.
-
-Evaluator failures and invalid `NaN` rewards fail fast. Silent simulated
-fallbacks belong neither to the algorithm nor to a trustworthy real experiment.
-
-## Package layout
+In sampling mode, a `BatchProvider` draws one `EvaluationBatch` before
+selection. The cost model and evaluator receive that exact object through
+`SearchContext.current_batch`. Item-level reuse keys use the canonical shape:
 
 ```text
-uct_engine/
-  interfaces.py   public state, batch, evaluator, and cost contracts
-  core.py         internal tree node and statistics
-  scoring.py      Agent-UCT score and reuse-aware marginal cost
-  search.py       paper-ordered search loop
-  examples/
-    rag_mock_example.py
-  tests/
+(configuration_prefix, cluster_id, item_id)
 ```
 
-The standalone package does not contain the former real-RAG driver, resume
-driver, or persistence module. Their authoritative historical versions remain
-with the OminiRAG experiment artifact.
+Only keys returned by the evaluator are materialized; the search core never
+invents physical cache hits.
 
-## Minimal usage
+For the RAG experiments, OminiRAG/RAGSpace is the integration layer. WTB is
+optional node-level cache/replay infrastructure rather than the search
+algorithm itself; at item level, that reuse can appear as a question cache.
 
-Implement:
+## Quick start
 
-- `SearchState` for the compositional configuration;
-- `Evaluator` for raw reward, realized cost, and exact materialized keys;
-- optionally `BatchProvider` for sampling mode;
-- optionally an `item_cost` callback for the paper's
-  `c(s, a, z, q)` term.
+Install the package and run the included deterministic example:
 
-Then construct:
+```powershell
+python -m pip install -e .
+python -m uct_engine.examples.rag_mock_example
+```
+
+Construct an engine with your state, evaluator, cost model, and optional batch
+provider:
 
 ```python
 from uct_engine import (
-    ClusterDef,
     CostAwareUCTScorer,
     ReuseAwareCostModel,
     UCTSearchEngine,
 )
 
-clusters = [
-    ClusterDef("cluster_a", weight=1.0, base_cost=1.0),
-    ClusterDef("cluster_b", weight=1.0, base_cost=1.0),
-]
-
 engine = UCTSearchEngine(
     evaluator=my_evaluator,
     scorer=CostAwareUCTScorer(lambda_0=0.05),
-    cost_model=ReuseAwareCostModel(
-        clusters,
-        item_cost=my_per_item_cost,
-    ),
+    cost_model=ReuseAwareCostModel(my_clusters),
     batch_provider=my_batch_provider,
-    exploration_constant=1.4,
     random_seed=42,
 )
-
-result = engine.search(root_state, max_iterations=350)
+result = engine.search(root_state, max_iterations=20)
 ```
 
-`ReuseAwareCostModel` normalizes non-negative cluster weights. Its default item
-cost is `ClusterDef.base_cost`; real integrations should pass a calibrated
-per-item/per-action cost callback.
+## Integration contract
 
-## Run
+An integration supplies:
+
+- `SearchState`, describing valid actions and stable prefix keys;
+- `Evaluator`, returning raw reward, realized cost, and materialized keys;
+- optionally `BatchProvider`, drawing exactly one initial batch per iteration;
+- `CostModel`, estimating marginal cost from the current batch and reuse keys.
+
+Cold-start evaluation remains integration-owned. A warmed ledger and the
+root-child visits/Q values produced by those evaluations enter the core as one
+atomic `WarmStartBundle`:
+
+```python
+from uct_engine import RootChildSeed, WarmStartBundle
+
+warm_start = WarmStartBundle(
+    context=cold_context,
+    root_child_seeds=(
+        RootChildSeed(
+            action="kg_extraction",
+            action_path=cold_action_path_a,
+            evaluated_state=cold_state_a,
+            reward=cold_reward_a,
+        ),
+        RootChildSeed(
+            action="standard_passage",
+            action_path=cold_action_path_b,
+            evaluated_state=cold_state_b,
+            reward=cold_reward_b,
+        ),
+    ),
+)
+result = engine.search(
+    root_state,
+    max_iterations=2,
+    warm_start=warm_start,
+)
+```
+
+The engine reuses the exact context object, including its random state,
+`materialized_keys`, cost, and evaluation count, while seeding root/child
+visits and Q values from the same bundle. Each seed's complete `action_path` is
+replayed from the root and must reproduce its terminal `evaluated_state`.
+`total_cost` must be finite and non-negative; `total_evaluations` must be a
+non-negative integer at least as large as the non-empty seed count. Ordinary
+`engine.search(root_state, ...)` remains a fresh, backend-agnostic search when
+no warm start is supplied.
+
+## Complete checkpoint and resume
+
+`SearchCheckpoint` captures the complete tree, search context, RNG state,
+best result, and completed main-loop iteration. The integration provides a
+lossless `CheckpointCodec` that maps domain states, structured actions, cache
+keys, batch item IDs, and context extras to JSON values:
+
+```python
+from uct_engine import SearchCheckpoint
+
+checkpoint = SearchCheckpoint.capture(result, my_checkpoint_codec)
+payload = checkpoint.to_payload()
+
+loaded = SearchCheckpoint.from_payload(payload_from_json)
+result = engine.resume(
+    loaded,
+    my_checkpoint_codec,
+    max_iterations=20,  # 20 additional iterations
+)
+```
+
+For crash-safe long runs, persist inside the keyword-only `on_checkpoint`
+callback. It receives the current complete `SearchResult` at the initialized
+or restored boundary, after every fully committed iteration, and after an
+evaluator failure that may have changed cost/cache accounting:
+
+```python
+def persist(current_result):
+    checkpoint = SearchCheckpoint.capture(current_result, my_checkpoint_codec)
+    atomic_write_json(checkpoint.to_payload())
+
+result = engine.search(
+    root_state,
+    max_iterations=350,
+    on_checkpoint=persist,
+)
+```
+
+Zero-iteration searches and resumes therefore still emit one recoverable
+checkpoint. Callback exceptions are not swallowed, so a failed durable write
+fails the run visibly. A failed evaluation is not assigned reward or
+backpropagated; its checkpoint retains the exact tree/RNG/context state and any
+accounting changes reported by the evaluator.
+
+The engine restores encoded node states and structured edge actions directly;
+it never rebuilds the tree by stringifying actions. Child order, cached action
+order, `N`, `value_sum`, per-node `best_value`, the previous batch, ledger,
+totals, `context.extra`, and exact `random.Random` state are retained. Callback
+iteration numbers continue at `completed_iterations + 1`, while `max_cost`
+remains an absolute whole-run ceiling.
+
+Durable storage, encryption, retention, provider/model compatibility checks,
+and atomic file/database writes remain integration responsibilities.
+
+The RAGSpace reference integration supplies three full-pool root-child rollouts
+as iteration 0, then calls the engine with `max_iterations=350`; its shared
+ledger therefore reports 353 terminal evaluations while main-loop callbacks
+remain numbered `1..350`. This warm-start mapping is an integration choice that
+is compatible with the paper's three full-pool initial evaluations; it is not a
+generic requirement imposed by this engine.
+
+## Scope and non-goals
+
+The package includes tree nodes, scoring, search iteration ordering, batch
+contracts, reuse-key accounting, and backend-neutral JSON checkpoint/resume.
+It intentionally does not include RAG components, benchmark loaders, model
+clients, stopping rules, checkpoint persistence, result analysis, or
+experiment launchers.
+
+Physical reuse must be implemented and verified by the integration backend.
+Logical key membership alone is not evidence that executor work was skipped.
+
+## Testing
+
+Run the standard-library test suite:
 
 ```powershell
-python -m pip install -e .
-python -m unittest discover -s uct_engine\tests -v
-python -m uct_engine.examples.rag_mock_example
+python -m unittest discover -s uct_engine\tests -p "test_*.py" -v
 ```
 
-The current suite has 20 tests covering basic search, custom scoring,
-cluster-level reuse, exact item-level cost, shared-batch identity, raw-reward
-selection, budget stopping, fail-fast evaluation, and empty-search behavior.
-
+The suite covers search behavior, custom scoring, raw-reward semantics, the
+inverse-square-root cost schedule, item-level keys, exact batch identity,
+context handoff, budget limits, evaluator failures, and repository hygiene.
+Checkpoint tests compare uninterrupted and JSON-round-tripped continuations at
+every iteration, including warmed-ledger runs.
