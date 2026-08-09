@@ -5,12 +5,15 @@ batch, scalar rewards/costs, and materialized reuse keys. Dataset loading,
 adaptive stopping rules, workflow execution, and physical cache backends belong
 to the experiment integration layer.
 """
+
 from __future__ import annotations
 
+import math
 import random
 from abc import ABC, abstractmethod
+from collections.abc import Hashable
 from dataclasses import dataclass, field
-from typing import Any, Hashable, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -25,7 +28,7 @@ class SearchState(Protocol):
         """Return actions that extend this configuration by one level."""
         ...
 
-    def child(self, action: Hashable) -> "SearchState":
+    def child(self, action: Hashable) -> SearchState:
         """Return the child configuration selected by ``action``."""
         ...
 
@@ -35,6 +38,21 @@ class SearchState(Protocol):
 
     def pretty(self) -> str:
         """Return a human-readable representation."""
+        ...
+
+
+@runtime_checkable
+class ReuseChildKeyProvider(Protocol):
+    """Optional, side-effect-free preview of one child prefix key.
+
+    Environment-backed states should implement this hook when ``child`` may
+    execute work.  Cost estimation can then inspect reuse without performing
+    the real transition.  Legacy states remain valid and fall back to
+    ``state.child(action).state_key()``.
+    """
+
+    def reuse_child_key(self, action: Hashable) -> Hashable:
+        """Return the stable key of ``action``'s child without executing it."""
         ...
 
 
@@ -120,6 +138,37 @@ class SearchContext:
 
 
 @dataclass
+class TransitionResult:
+    """One realized environment transition and its non-reward effects.
+
+    ``realized_cost`` and ``materialized_keys`` are accumulated across the
+    expansion and rollout of one search iteration. On success, the engine
+    merges them with the terminal evaluator result at one boundary. If the
+    evaluator fails, already-realized transition effects are retained only for
+    recovery and no reward is backed up.
+    """
+
+    state: SearchState
+    realized_cost: float = 0.0
+    materialized_keys: set[Hashable] = field(default_factory=set)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, SearchState):
+            raise TypeError("transition state must implement SearchState")
+        if isinstance(self.realized_cost, bool) or not isinstance(
+            self.realized_cost, (int, float)
+        ):
+            raise TypeError("transition realized_cost must be numeric")
+        cost = float(self.realized_cost)
+        if not math.isfinite(cost) or cost < 0:
+            raise ValueError("transition realized_cost must be finite and non-negative")
+        self.realized_cost = cost
+        self.materialized_keys = set(self.materialized_keys)
+        self.metadata = dict(self.metadata)
+
+
+@dataclass
 class SearchResult:
     """Outcome of a completed Agent-UCT search."""
 
@@ -141,6 +190,38 @@ class BatchProvider(ABC):
         ...
 
 
+class TransitionModel(ABC):
+    """Execute one search action in a real or simulated environment.
+
+    Implementations observe ``SearchContext`` but must report accounting
+    effects in ``TransitionResult`` rather than mutating the context's cost,
+    reuse keys, or evaluation counter themselves.
+    """
+
+    @abstractmethod
+    def transition(
+        self,
+        state: SearchState,
+        action: Hashable,
+        context: SearchContext,
+    ) -> TransitionResult:
+        """Return the successor plus realized non-reward effects."""
+        ...
+
+
+class ChildTransitionModel(TransitionModel):
+    """Backward-compatible transition using ``SearchState.child`` only."""
+
+    def transition(
+        self,
+        state: SearchState,
+        action: Hashable,
+        context: SearchContext,
+    ) -> TransitionResult:
+        del context
+        return TransitionResult(state=state.child(action))
+
+
 class Evaluator(ABC):
     """Evaluate a completed configuration.
 
@@ -156,8 +237,7 @@ class Evaluator(ABC):
         self,
         state: SearchState,
         context: SearchContext,
-    ) -> EvaluationResult:
-        ...
+    ) -> EvaluationResult: ...
 
 
 class CostModel(ABC):
@@ -169,8 +249,7 @@ class CostModel(ABC):
         state: SearchState,
         action: Hashable,
         context: SearchContext,
-    ) -> float:
-        ...
+    ) -> float: ...
 
 
 class ScoreFunction(ABC):
@@ -185,5 +264,4 @@ class ScoreFunction(ABC):
         marginal_cost: float,
         exploration_constant: float,
         iteration: int = 1,
-    ) -> float:
-        ...
+    ) -> float: ...

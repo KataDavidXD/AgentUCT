@@ -1,9 +1,11 @@
 """Agent-UCT selection score and reuse-aware marginal-cost model."""
+
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
-from typing import Hashable
+from collections.abc import Callable, Hashable
+from dataclasses import dataclass
+from enum import Enum
 
 from .interfaces import (
     ClusterDef,
@@ -19,24 +21,65 @@ ItemCostFunction = Callable[
 ]
 
 
+class CostPenaltySchedule(str, Enum):
+    """Supported schedules for the selection-only reuse-cost coefficient."""
+
+    CONSTANT = "constant"
+    INVERSE_SQRT = "inverse_sqrt"
+
+
+@dataclass(frozen=True)
+class UCTScoreTerms:
+    """Exact decomposition of one standard Agent-UCT selection score.
+
+    ``uct_score`` is the cost-free UCT-only ablation signal.  The final
+    ``selection_score`` subtracts the decayed cost penalty.  None of these
+    node-local search-policy terms is a trajectory advantage.
+    """
+
+    child_q_raw: float
+    exploration_bonus: float
+    marginal_cost: float
+    lambda_t: float
+    decayed_cost_penalty: float
+    uct_score: float
+    selection_score: float
+    cost_schedule: str = CostPenaltySchedule.INVERSE_SQRT.value
+
+
 class CostAwareUCTScorer(ScoreFunction):
-    r"""Compute the paper's Agent-UCT tree-selection score.
+    r"""Compute a cost-aware Agent-UCT tree-selection score.
 
     .. math::
 
         \widehat Q_t(s,a)
         + c_{\mathrm{UCT}}
           \sqrt{\frac{\log(N_t(s)+1)}{N_t(s,a)+1}}
-        - \frac{\lambda_0}{\sqrt{t}}\widehat{\Delta C}_t(s,a)
+        - \beta_t\widehat{\Delta C}_t(s,a)
+
+    The default schedule preserves the original
+    :math:`\beta_t=\lambda_0/\sqrt{t}` behavior.  ``schedule="constant"`` uses
+    :math:`\beta_t=\lambda_0`, while ``lambda_0=0`` is vanilla UCT under either
+    schedule.
 
     The cost penalty affects selection only. Rewards stored in tree statistics
     and the final best configuration are not cost-adjusted.
     """
 
-    def __init__(self, lambda_0: float = 0.0) -> None:
-        if lambda_0 < 0:
-            raise ValueError("lambda_0 must be non-negative")
+    def __init__(
+        self,
+        lambda_0: float = 0.0,
+        *,
+        schedule: CostPenaltySchedule | str = CostPenaltySchedule.INVERSE_SQRT,
+    ) -> None:
+        if not math.isfinite(lambda_0) or lambda_0 < 0:
+            raise ValueError("lambda_0 must be finite and non-negative")
         self.lambda_0 = float(lambda_0)
+        try:
+            self.schedule = CostPenaltySchedule(schedule)
+        except (TypeError, ValueError) as exc:
+            allowed = ", ".join(item.value for item in CostPenaltySchedule)
+            raise ValueError(f"schedule must be one of: {allowed}") from exc
 
     def score(
         self,
@@ -47,20 +90,71 @@ class CostAwareUCTScorer(ScoreFunction):
         exploration_constant: float,
         iteration: int = 1,
     ) -> float:
-        if parent_visits < 0 or child_visits < 0:
-            raise ValueError("visit counts must be non-negative")
-        if marginal_cost < 0:
-            raise ValueError("marginal_cost must be non-negative")
-        if exploration_constant < 0:
-            raise ValueError("exploration_constant must be non-negative")
-        if iteration < 1:
-            raise ValueError("iteration must be at least 1")
+        """Return the final Agent-UCT selection score."""
+        return self.decompose(
+            parent_visits=parent_visits,
+            child_visits=child_visits,
+            child_q=child_q,
+            marginal_cost=marginal_cost,
+            exploration_constant=exploration_constant,
+            iteration=iteration,
+        ).selection_score
+
+    def decompose(
+        self,
+        parent_visits: int,
+        child_visits: int,
+        child_q: float,
+        marginal_cost: float,
+        exploration_constant: float,
+        iteration: int = 1,
+    ) -> UCTScoreTerms:
+        """Return every numeric term without changing scorer semantics."""
+        if (
+            isinstance(parent_visits, bool)
+            or not isinstance(parent_visits, int)
+            or parent_visits < 0
+        ):
+            raise ValueError("parent_visits must be a non-negative integer")
+        if (
+            isinstance(child_visits, bool)
+            or not isinstance(child_visits, int)
+            or child_visits < 0
+        ):
+            raise ValueError("child_visits must be a non-negative integer")
+        if not math.isfinite(child_q):
+            raise ValueError("child_q must be finite")
+        if not math.isfinite(marginal_cost) or marginal_cost < 0:
+            raise ValueError("marginal_cost must be finite and non-negative")
+        if not math.isfinite(exploration_constant) or exploration_constant < 0:
+            raise ValueError("exploration_constant must be finite and non-negative")
+        if (
+            isinstance(iteration, bool)
+            or not isinstance(iteration, int)
+            or iteration < 1
+        ):
+            raise ValueError("iteration must be an integer of at least 1")
 
         exploration = exploration_constant * math.sqrt(
             math.log(parent_visits + 1) / (child_visits + 1)
         )
-        lambda_t = self.lambda_0 / math.sqrt(iteration)
-        return child_q + exploration - lambda_t * marginal_cost
+        lambda_t = (
+            self.lambda_0
+            if self.schedule is CostPenaltySchedule.CONSTANT
+            else self.lambda_0 / math.sqrt(iteration)
+        )
+        penalty = lambda_t * marginal_cost
+        uct_score = child_q + exploration
+        return UCTScoreTerms(
+            child_q_raw=float(child_q),
+            exploration_bonus=exploration,
+            marginal_cost=float(marginal_cost),
+            lambda_t=lambda_t,
+            decayed_cost_penalty=penalty,
+            uct_score=uct_score,
+            selection_score=uct_score - penalty,
+            cost_schedule=self.schedule.value,
+        )
 
 
 class ReuseAwareCostModel(CostModel):
@@ -100,12 +194,10 @@ class ReuseAwareCostModel(CostModel):
 
         self.clusters = tuple(clusters)
         self._weights = {
-            cluster.cluster_id: cluster.weight / total_weight
-            for cluster in clusters
+            cluster.cluster_id: cluster.weight / total_weight for cluster in clusters
         }
         self._base_costs = {
-            cluster.cluster_id: cluster.base_cost
-            for cluster in clusters
+            cluster.cluster_id: cluster.base_cost for cluster in clusters
         }
         self._item_cost = item_cost or self._default_item_cost
 
@@ -115,7 +207,16 @@ class ReuseAwareCostModel(CostModel):
         action: Hashable,
         context: SearchContext,
     ) -> float:
-        child_prefix = state.child(action).state_key()
+        reuse_child_key = getattr(state, "reuse_child_key", None)
+        child_prefix = (
+            reuse_child_key(action)
+            if callable(reuse_child_key)
+            else state.child(action).state_key()
+        )
+        try:
+            hash(child_prefix)
+        except TypeError as exc:
+            raise TypeError("reuse child key must be hashable") from exc
         batch = context.current_batch
         if batch is None:
             return self._cluster_level_cost(

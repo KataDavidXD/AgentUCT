@@ -4,29 +4,33 @@ Each iteration follows the paper boundary:
 
 1. draw one optional initial batch ``B_t``;
 2. select with reuse-aware marginal cost computed from that batch;
-3. expand and complete a configuration;
-4. evaluate with the same batch;
-5. merge only evaluator-reported reuse keys;
+3. expand and complete a configuration through the transition model;
+4. evaluate the terminal state with the same batch;
+5. merge transition and evaluator cost/reuse effects once;
 6. backpropagate the raw reward.
 """
+
 from __future__ import annotations
 
 import math
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Hashable
+from typing import Any
 
 from .checkpoint import CheckpointCodec, SearchCheckpoint
 from .core import TreeNode
 from .interfaces import (
     BatchProvider,
+    ChildTransitionModel,
     CostModel,
     Evaluator,
     ScoreFunction,
     SearchContext,
     SearchResult,
     SearchState,
+    TransitionModel,
+    TransitionResult,
 )
 
 
@@ -63,6 +67,18 @@ class RandomChoiceAudit:
 
 
 @dataclass(frozen=True)
+class TransitionStepAudit:
+    """One realized expansion or rollout environment transition."""
+
+    phase: str
+    state_path: tuple[Hashable, ...]
+    action: Hashable
+    resulting_state_path: tuple[Hashable, ...]
+    realized_cost: float
+    materialized_keys_reported: int
+
+
+@dataclass(frozen=True)
 class BackpropagationAudit:
     """One tree node's N/Q transition for the raw iteration reward."""
 
@@ -87,6 +103,11 @@ class CacheCostAudit:
     total_cost_after_evaluation: float
     total_evaluations_before: int
     total_evaluations_after: int
+    transition_calls: int = 0
+    transition_cost: float = 0.0
+    terminal_evaluation_cost: float = 0.0
+    transition_materialized_keys_reported: int = 0
+    terminal_materialized_keys_reported: int = 0
 
 
 @dataclass(frozen=True)
@@ -104,6 +125,7 @@ class IterationAlgorithmAudit:
     backpropagation: tuple[BackpropagationAudit, ...]
     cache_cost: CacheCostAudit
     batch_cluster_sizes: tuple[tuple[str, int], ...]
+    transition_steps: tuple[TransitionStepAudit, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -121,6 +143,8 @@ class IterationRecord:
     best_reward: float
     evaluation_metadata: dict[str, Any] = field(default_factory=dict)
     algorithm_audit: IterationAlgorithmAudit | None = None
+    transition_cost: float = 0.0
+    terminal_evaluation_cost: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -138,11 +162,7 @@ class RootChildSeed:
     action_path: tuple[Hashable, ...] | None = None
 
     def __post_init__(self) -> None:
-        path = (
-            (self.action,)
-            if self.action_path is None
-            else tuple(self.action_path)
-        )
+        path = (self.action,) if self.action_path is None else tuple(self.action_path)
         if not path:
             raise ValueError("root-child seed action_path must not be empty")
         if path[0] != self.action:
@@ -216,7 +236,10 @@ OnCheckpointCallback = Callable[[SearchResult], None]
 
 def random_rollout(state: SearchState, rng: random.Random) -> SearchState:
     """Complete ``state`` by uniformly sampling available actions."""
-    terminal, _actions, _choices = _random_rollout_with_actions(state, rng)
+    terminal, _actions, _choices, _transitions, _effects = _random_rollout_with_actions(
+        state,
+        rng,
+    )
     return terminal
 
 
@@ -225,16 +248,22 @@ def _random_rollout_with_actions(
     rng: random.Random,
     *,
     initial_path: tuple[Hashable, ...] = (),
+    transition_model: TransitionModel | None = None,
+    context: SearchContext | None = None,
 ) -> tuple[
     SearchState,
     tuple[Hashable, ...],
     tuple[RandomChoiceAudit, ...],
+    tuple[TransitionStepAudit, ...],
+    tuple[TransitionResult, ...],
 ]:
     """Complete ``state`` and retain only the chosen action identifiers."""
 
     current = state
     selected_actions: list[Hashable] = []
     choices: list[RandomChoiceAudit] = []
+    transitions: list[TransitionStepAudit] = []
+    effects: list[TransitionResult] = []
     while not current.is_terminal():
         actions = current.available_actions()
         if not actions:
@@ -251,8 +280,34 @@ def _random_rollout_with_actions(
             )
         )
         selected_actions.append(action)
-        current = current.child(action)
-    return current, tuple(selected_actions), tuple(choices)
+        state_path = initial_path + tuple(selected_actions[:-1])
+        if transition_model is None:
+            transition = TransitionResult(state=current.child(action))
+        else:
+            if context is None:
+                raise TypeError("context is required with a transition_model")
+            transition = transition_model.transition(current, action, context)
+            if not isinstance(transition, TransitionResult):
+                raise TypeError("transition_model must return TransitionResult")
+        current = transition.state
+        transitions.append(
+            TransitionStepAudit(
+                phase="rollout",
+                state_path=state_path,
+                action=action,
+                resulting_state_path=state_path + (action,),
+                realized_cost=transition.realized_cost,
+                materialized_keys_reported=len(transition.materialized_keys),
+            )
+        )
+        effects.append(transition)
+    return (
+        current,
+        tuple(selected_actions),
+        tuple(choices),
+        tuple(transitions),
+        tuple(effects),
+    )
 
 
 class UCTSearchEngine:
@@ -266,6 +321,7 @@ class UCTSearchEngine:
         exploration_constant: float = 1.4,
         random_seed: int | None = 42,
         batch_provider: BatchProvider | None = None,
+        transition_model: TransitionModel | None = None,
     ) -> None:
         if exploration_constant < 0:
             raise ValueError("exploration_constant must be non-negative")
@@ -275,6 +331,39 @@ class UCTSearchEngine:
         self.exploration_constant = float(exploration_constant)
         self.random_seed = random_seed
         self.batch_provider = batch_provider
+        if transition_model is not None and not callable(
+            getattr(transition_model, "transition", None)
+        ):
+            raise TypeError("transition_model must implement transition()")
+        self.transition_model = transition_model or ChildTransitionModel()
+
+    def export_search_signals(
+        self,
+        result: SearchResult,
+        *,
+        iteration: int,
+        context: SearchContext | None = None,
+        encode_value: Callable[[Hashable], Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return a JSON-safe UCT/Agent-UCT snapshot for audit or ablation.
+
+        This additive API is defined for the standard
+        :class:`CostAwareUCTScorer`.  It never mutates search state and its
+        scores are node-local search-policy diagnostics, not advantages.
+        ``iteration`` is explicit because the result's attached batch may be
+        from a different iteration than the requested projection.
+        """
+        from .signals import export_search_signals
+
+        return export_search_signals(
+            result,
+            scorer=self.scorer,  # type: ignore[arg-type]
+            cost_model=self.cost_model,
+            exploration_constant=self.exploration_constant,
+            iteration=iteration,
+            context=context,
+            encode_value=encode_value,
+        )
 
     def search(
         self,
@@ -317,9 +406,7 @@ class UCTSearchEngine:
             root_child_seeds = warm_start.root_child_seeds
 
         root = TreeNode(state=root_state)
-        best_state, best_reward = self._apply_root_child_seeds(
-            root, root_child_seeds
-        )
+        best_state, best_reward = self._apply_root_child_seeds(root, root_child_seeds)
         if on_checkpoint is not None:
             on_checkpoint(
                 self._search_result(
@@ -444,12 +531,32 @@ class UCTSearchEngine:
             expanded = False
             expanded_action: Hashable | None = None
             expansion_candidates: tuple[Hashable, ...] = ()
+            transition_steps: list[TransitionStepAudit] = []
+            transition_effects: list[TransitionResult] = []
             if not node.state.is_terminal():
                 unexpanded = node.unexpanded_actions()
                 if unexpanded:
                     expansion_candidates = tuple(unexpanded)
                     action = rng.choice(unexpanded)
-                    node = node.add_child(action, node.state.child(action))
+                    transition = self._execute_transition(
+                        node.state,
+                        action,
+                        context,
+                    )
+                    node = node.add_child(action, transition.state)
+                    transition_effects.append(transition)
+                    transition_steps.append(
+                        TransitionStepAudit(
+                            phase="expansion",
+                            state_path=selection_path,
+                            action=action,
+                            resulting_state_path=selection_path + (action,),
+                            realized_cost=transition.realized_cost,
+                            materialized_keys_reported=len(
+                                transition.materialized_keys
+                            ),
+                        )
+                    )
                     expanded = True
                     expanded_action = action
 
@@ -458,19 +565,38 @@ class UCTSearchEngine:
                 evaluated_state = node.state
                 rollout_actions: tuple[Hashable, ...] = ()
                 rollout_choices: tuple[RandomChoiceAudit, ...] = ()
+                rollout_transition_steps: tuple[TransitionStepAudit, ...] = ()
+                rollout_transition_effects: tuple[TransitionResult, ...] = ()
             else:
                 (
                     evaluated_state,
                     rollout_actions,
                     rollout_choices,
+                    rollout_transition_steps,
+                    rollout_transition_effects,
                 ) = _random_rollout_with_actions(
                     node.state,
                     rng,
                     initial_path=tree_evaluation_path,
+                    transition_model=self.transition_model,
+                    context=context,
                 )
+            transition_steps.extend(rollout_transition_steps)
+            transition_effects.extend(rollout_transition_effects)
+            transition_cost = math.fsum(
+                effect.realized_cost for effect in transition_effects
+            )
+            transition_keys: set[Hashable] = set()
+            for effect in transition_effects:
+                transition_keys.update(effect.materialized_keys)
             try:
                 result = self.evaluator.evaluate(evaluated_state, context)
             except BaseException:
+                # The environment has already realized these effects even
+                # though no terminal reward exists. Preserve them for recovery
+                # without incrementing evaluations or backing up the tree.
+                context.materialized_keys.update(transition_keys)
+                context.total_cost += transition_cost
                 # Evaluators may have incurred provider cost or committed an
                 # isolated physical-cache shard before reporting failure.  The
                 # current tree, RNG, context, and accounting state are therefore
@@ -488,20 +614,30 @@ class UCTSearchEngine:
                     )
                 raise
             reward = float(result.reward)
-            evaluation_cost = float(result.total_cost)
+            terminal_evaluation_cost = float(result.total_cost)
             if not math.isfinite(reward):
                 raise ValueError(
                     f"evaluator returned a non-finite reward: {result.reward!r}"
                 )
-            if not math.isfinite(evaluation_cost) or evaluation_cost < 0:
+            if (
+                not math.isfinite(terminal_evaluation_cost)
+                or terminal_evaluation_cost < 0
+            ):
                 raise ValueError(
-                    "evaluator returned an invalid total_cost: "
-                    f"{result.total_cost!r}"
+                    f"evaluator returned an invalid total_cost: {result.total_cost!r}"
                 )
 
+            evaluation_cost = math.fsum((transition_cost, terminal_evaluation_cost))
+            if not math.isfinite(evaluation_cost):
+                raise ValueError("combined iteration cost must be finite")
+            evaluator_keys = set(result.materialized_keys)
+            merged_keys = transition_keys | evaluator_keys
+
             keys_before = len(context.materialized_keys)
-            keys_reported = len(result.materialized_keys)
-            context.materialized_keys.update(result.materialized_keys)
+            keys_reported = len(merged_keys)
+            # One successful iteration has one logical merge boundary. Neither
+            # expansion nor rollout effects become visible during evaluation.
+            context.materialized_keys.update(merged_keys)
             keys_added = len(context.materialized_keys) - keys_before
             context.total_cost += evaluation_cost
             context.total_evaluations += 1
@@ -566,8 +702,14 @@ class UCTSearchEngine:
                     total_cost_after_evaluation=context.total_cost,
                     total_evaluations_before=total_evaluations_before,
                     total_evaluations_after=context.total_evaluations,
+                    transition_calls=len(transition_effects),
+                    transition_cost=transition_cost,
+                    terminal_evaluation_cost=terminal_evaluation_cost,
+                    transition_materialized_keys_reported=len(transition_keys),
+                    terminal_materialized_keys_reported=len(evaluator_keys),
                 ),
                 batch_cluster_sizes=batch_cluster_sizes,
+                transition_steps=tuple(transition_steps),
             )
 
             if on_iteration is not None:
@@ -585,6 +727,8 @@ class UCTSearchEngine:
                         best_reward=best_reward,
                         evaluation_metadata=dict(result.metadata),
                         algorithm_audit=algorithm_audit,
+                        transition_cost=transition_cost,
+                        terminal_evaluation_cost=terminal_evaluation_cost,
                     )
                 )
 
@@ -644,13 +788,9 @@ class UCTSearchEngine:
         best_reward = float("-inf")
         for seed in seeds:
             if seed.action in seen_actions:
-                raise ValueError(
-                    f"duplicate root-child seed action: {seed.action!r}"
-                )
+                raise ValueError(f"duplicate root-child seed action: {seed.action!r}")
             if seed.action not in available_actions:
-                raise ValueError(
-                    f"unknown root-child seed action: {seed.action!r}"
-                )
+                raise ValueError(f"unknown root-child seed action: {seed.action!r}")
             if not seed.evaluated_state.is_terminal():
                 raise ValueError("root-child seed evaluated_state must be terminal")
             replayed_state = root.state
@@ -670,8 +810,7 @@ class UCTSearchEngine:
                     child_state = replayed_state
             if (
                 not replayed_state.is_terminal()
-                or replayed_state.state_key()
-                != seed.evaluated_state.state_key()
+                or replayed_state.state_key() != seed.evaluated_state.state_key()
             ):
                 raise ValueError(
                     "root-child seed action_path does not reproduce "
@@ -695,6 +834,17 @@ class UCTSearchEngine:
                 best_reward = reward
 
         return best_state, best_reward
+
+    def _execute_transition(
+        self,
+        state: SearchState,
+        action: Hashable,
+        context: SearchContext,
+    ) -> TransitionResult:
+        transition = self.transition_model.transition(state, action, context)
+        if not isinstance(transition, TransitionResult):
+            raise TypeError("transition_model must return TransitionResult")
+        return transition
 
     def _select(
         self,
@@ -726,9 +876,7 @@ class UCTSearchEngine:
         best_score = float("-inf")
         best_child: TreeNode | None = None
         best_action: Hashable | None = None
-        candidates: list[
-            tuple[Hashable, TreeNode, float, float]
-        ] = []
+        candidates: list[tuple[Hashable, TreeNode, float, float]] = []
         for action, child in node.children.items():
             marginal_cost = self.cost_model.marginal_cost(
                 node.state,

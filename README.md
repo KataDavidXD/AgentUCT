@@ -16,7 +16,7 @@ reuse without coupling the search core to one RAG stack or execution backend.
 
 ## How the method works
 
-At iteration `t`, the engine scores a child with:
+At iteration `t`, the default inverse-square-root schedule scores a child with:
 
 ```text
 Q(s, a)
@@ -26,6 +26,58 @@ Q(s, a)
 
 The cost term changes selection only. Evaluation, backpropagation, and final
 best-state selection use the evaluator's finite raw reward.
+
+`CostAwareUCTScorer(lambda_0=beta_c, schedule="constant")` instead uses the
+same constant `beta_c` at every iteration. The default remains
+`schedule="inverse_sqrt"` for backward compatibility. With `lambda_0=0`, both
+schedules reduce exactly to vanilla UCT.
+
+## UCT signal export and ablation
+
+The standard scorer exposes an additive, observational signal boundary:
+
+```python
+payload = engine.export_search_signals(result, iteration=next_iteration)
+```
+
+The returned dictionary is strict-JSON-safe and contains every actionable
+node and action: parent/child `N`, raw `Q`, exploration bonus, marginal cost,
+`lambda_t`, decayed cost penalty, the cost-free `uct_score`, and the final
+`agent_uct_selection_score`. A caller-supplied `encode_value` handles custom
+structured actions. Run the deterministic payload example with:
+
+```powershell
+python -m uct_engine.examples.export_signals_example
+```
+
+`uct_score = Q + exploration` is the independent UCT-only ablation signal.
+For a real UCT-only experiment, rerun the engine with `lambda_0=0`; the
+cost-free score exported from an Agent-UCT run is a counterfactual audit and
+does not replace the trajectory that UCT-only selection would produce.
+
+At temperature 1, `visit_policy_probability` is `N(s,a)` normalized over the
+node's children. It can be used by an integration as an MCTS policy target or
+behavior diagnostic. It is not a scalar advantage. Neither `Q`, exploration,
+cost, penalty, UCT score, Agent-UCT score, nor visit policy is a trajectory
+return or a PPO/GRPO/AT-PPO advantage. Any such training estimator remains an
+explicit integration-layer computation.
+
+The exporter does not draw a batch or mutate/evaluate/backpropagate the tree.
+It is a snapshot projection over the final tree, the explicitly supplied
+`iteration`, and the supplied context's `current_batch` and logical reuse
+keys. It is not a historical selection trace; use
+`IterationAlgorithmAudit.selection_steps` for the path and scores actually
+observed during an iteration. In particular, a completed result may still
+carry the previous iteration's batch, so callers projecting another batch
+must pass a matching `context` explicitly.
+
+Logical reuse edges reported by evaluators show the selection-side
+bipartite-graph effect, but do not prove that a physical cache or SQLite
+backend skipped work. At a node with unexpanded actions, the engine uses
+random expansion; the payload marks those scores
+`eligible_for_engine_argmax_if_node_reached=false`. Fully expanded nodes expose
+both `uct_only_snapshot_argmax_action` and
+`agent_uct_snapshot_argmax_action`.
 
 In sampling mode, a `BatchProvider` draws one `EvaluationBatch` before
 selection. The cost model and evaluator receive that exact object through
@@ -71,14 +123,28 @@ engine = UCTSearchEngine(
 result = engine.search(root_state, max_iterations=20)
 ```
 
+Environment-backed search can additionally supply a `TransitionModel`.
+Expansion and rollout both call `transition(state, action, context)` and receive
+a `TransitionResult` containing the successor state, realized cost, and
+materialized reuse keys. The default `ChildTransitionModel` preserves the old
+`SearchState.child(action)` behavior with zero realized effects.
+
 ## Integration contract
 
 An integration supplies:
 
 - `SearchState`, describing valid actions and stable prefix keys;
+- optionally `SearchState.reuse_child_key(action)`, a side-effect-free key
+  preview used by reuse-cost selection when `child` may execute real work;
+- optionally `TransitionModel`, executing expansion and rollout actions and
+  reporting their realized cost/reuse effects;
 - `Evaluator`, returning raw reward, realized cost, and materialized keys;
 - optionally `BatchProvider`, drawing exactly one initial batch per iteration;
 - `CostModel`, estimating marginal cost from the current batch and reuse keys.
+
+On a successful iteration, transition effects and the terminal evaluator's
+effects are unioned/summed into one context merge. Their cost is audited but is
+never subtracted from the reward backed up into `N`, `value_sum`, or `Q`.
 
 Cold-start evaluation remains integration-owned. A warmed ledger and the
 root-child visits/Q values produced by those evaluations enter the core as one

@@ -14,6 +14,12 @@ README_PATHS = (
 
 
 class TestRepositoryHygiene(unittest.TestCase):
+    def test_readme_copies_stay_synchronized(self) -> None:
+        self.assertEqual(
+            README_PATHS[0].read_text(encoding="utf-8"),
+            README_PATHS[1].read_text(encoding="utf-8"),
+        )
+
     def test_readme_is_project_focused_and_submission_neutral(self) -> None:
         readme = README_PATHS[0].read_text(encoding="utf-8")
         lowered = readme.lower()
