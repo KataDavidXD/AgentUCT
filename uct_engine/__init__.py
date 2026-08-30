@@ -29,6 +29,7 @@ from .scoring import (
 from .search import (
     BackpropagationAudit,
     CacheCostAudit,
+    ExpansionCandidateAudit,
     IterationAlgorithmAudit,
     IterationRecord,
     OnCheckpointCallback,
@@ -58,6 +59,7 @@ __all__ = [
     "EvaluationBatch",
     "EvaluationResult",
     "Evaluator",
+    "ExpansionCandidateAudit",
     "ItemCostFunction",
     "IterationAlgorithmAudit",
     "IterationRecord",

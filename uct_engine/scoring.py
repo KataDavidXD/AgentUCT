@@ -22,7 +22,7 @@ ItemCostFunction = Callable[
 
 
 class CostPenaltySchedule(str, Enum):
-    """Supported schedules for the selection-only reuse-cost coefficient."""
+    """Supported schedules for the reuse-cost coefficient."""
 
     CONSTANT = "constant"
     INVERSE_SQRT = "inverse_sqrt"
@@ -40,7 +40,10 @@ class UCTScoreTerms:
     child_q_raw: float
     exploration_bonus: float
     marginal_cost: float
+    normalized_marginal_cost: float
+    cost_scale: float
     lambda_t: float
+    selection_cost_coefficient: float
     decayed_cost_penalty: float
     uct_score: float
     selection_score: float
@@ -55,15 +58,22 @@ class CostAwareUCTScorer(ScoreFunction):
         \widehat Q_t(s,a)
         + c_{\mathrm{UCT}}
           \sqrt{\frac{\log(N_t(s)+1)}{N_t(s,a)+1}}
-        - \beta_t\widehat{\Delta C}_t(s,a)
+        - \beta_t\frac{\widehat{\Delta C}_t(s,a)}{C_{\mathrm{scale}}}
+
+    ``cost_scale`` is one positive global denominator.  It is never recomputed
+    from the remaining candidates at a node, so costs stay comparable across
+    depths, iterations, and cache states.  The default ``1`` preserves the
+    historical raw-cost behavior.
 
     The default schedule preserves the original
     :math:`\beta_t=\lambda_0/\sqrt{t}` behavior.  ``schedule="constant"`` uses
     :math:`\beta_t=\lambda_0`, while ``lambda_0=0`` is vanilla UCT under either
     schedule.
 
-    The cost penalty affects selection only. Rewards stored in tree statistics
-    and the final best configuration are not cost-adjusted.
+    ``cost_aware_selection`` and ``cost_aware_expansion`` independently choose
+    where the same scheduled, globally normalized coefficient is active.
+    Expansion remains opt-in for backward compatibility.  Rewards stored in
+    tree statistics and the final best configuration are never cost-adjusted.
     """
 
     def __init__(
@@ -71,10 +81,22 @@ class CostAwareUCTScorer(ScoreFunction):
         lambda_0: float = 0.0,
         *,
         schedule: CostPenaltySchedule | str = CostPenaltySchedule.INVERSE_SQRT,
+        cost_aware_expansion: bool = False,
+        cost_aware_selection: bool = True,
+        cost_scale: float = 1.0,
     ) -> None:
         if not math.isfinite(lambda_0) or lambda_0 < 0:
             raise ValueError("lambda_0 must be finite and non-negative")
+        if not isinstance(cost_aware_expansion, bool):
+            raise TypeError("cost_aware_expansion must be boolean")
+        if not isinstance(cost_aware_selection, bool):
+            raise TypeError("cost_aware_selection must be boolean")
+        if not math.isfinite(cost_scale) or cost_scale <= 0:
+            raise ValueError("cost_scale must be finite and strictly positive")
         self.lambda_0 = float(lambda_0)
+        self.cost_aware_expansion = cost_aware_expansion
+        self.cost_aware_selection = cost_aware_selection
+        self.cost_scale = float(cost_scale)
         try:
             self.schedule = CostPenaltySchedule(schedule)
         except (TypeError, ValueError) as exc:
@@ -99,6 +121,38 @@ class CostAwareUCTScorer(ScoreFunction):
             exploration_constant=exploration_constant,
             iteration=iteration,
         ).selection_score
+
+    def _scheduled_cost_coefficient(self, iteration: int) -> float:
+        if (
+            isinstance(iteration, bool)
+            or not isinstance(iteration, int)
+            or iteration < 1
+        ):
+            raise ValueError("iteration must be an integer of at least 1")
+        return (
+            self.lambda_0
+            if self.schedule is CostPenaltySchedule.CONSTANT
+            else self.lambda_0 / math.sqrt(iteration)
+        )
+
+    def expansion_cost_coefficient(self, iteration: int) -> float:
+        """Return the scheduled coefficient for the explicit expansion site."""
+
+        coefficient = self._scheduled_cost_coefficient(iteration)
+        return coefficient if self.cost_aware_expansion else 0.0
+
+    def selection_cost_coefficient(self, iteration: int) -> float:
+        """Return the scheduled coefficient for existing-child selection."""
+
+        coefficient = self._scheduled_cost_coefficient(iteration)
+        return coefficient if self.cost_aware_selection else 0.0
+
+    def normalize_marginal_cost(self, marginal_cost: float) -> float:
+        """Normalize a validated raw marginal cost by the frozen global scale."""
+
+        if not math.isfinite(marginal_cost) or marginal_cost < 0:
+            raise ValueError("marginal_cost must be finite and non-negative")
+        return float(marginal_cost) / self.cost_scale
 
     def decompose(
         self,
@@ -138,18 +192,19 @@ class CostAwareUCTScorer(ScoreFunction):
         exploration = exploration_constant * math.sqrt(
             math.log(parent_visits + 1) / (child_visits + 1)
         )
-        lambda_t = (
-            self.lambda_0
-            if self.schedule is CostPenaltySchedule.CONSTANT
-            else self.lambda_0 / math.sqrt(iteration)
-        )
-        penalty = lambda_t * marginal_cost
+        lambda_t = self._scheduled_cost_coefficient(iteration)
+        normalized_cost = self.normalize_marginal_cost(marginal_cost)
+        selection_coefficient = self.selection_cost_coefficient(iteration)
+        penalty = selection_coefficient * normalized_cost
         uct_score = child_q + exploration
         return UCTScoreTerms(
             child_q_raw=float(child_q),
             exploration_bonus=exploration,
             marginal_cost=float(marginal_cost),
+            normalized_marginal_cost=normalized_cost,
+            cost_scale=self.cost_scale,
             lambda_t=lambda_t,
+            selection_cost_coefficient=selection_coefficient,
             decayed_cost_penalty=penalty,
             uct_score=uct_score,
             selection_score=uct_score - penalty,

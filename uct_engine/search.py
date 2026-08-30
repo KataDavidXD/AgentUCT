@@ -32,6 +32,7 @@ from .interfaces import (
     TransitionModel,
     TransitionResult,
 )
+from .scoring import CostAwareUCTScorer
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,10 @@ class SelectionCandidateAudit:
     marginal_cost: float
     score: float
     selected: bool
+    normalized_marginal_cost: float = 0.0
+    cost_scale: float = 1.0
+    cost_coefficient: float = 0.0
+    uct_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -55,15 +60,33 @@ class SelectionStepAudit:
     parent_q: float
     selected_action: Hashable
     candidates: tuple[SelectionCandidateAudit, ...]
+    cost_penalty_changed_argmax: bool = False
+
+
+@dataclass(frozen=True)
+class ExpansionCandidateAudit:
+    """One term in a cost-tilted uniform expansion proposal."""
+
+    action: Hashable
+    marginal_cost: float
+    normalized_marginal_cost: float
+    cost_scale: float
+    base_logprob: float
+    log_bias: float
+    final_logprob: float
+    selected: bool
 
 
 @dataclass(frozen=True)
 class RandomChoiceAudit:
-    """One uniform random choice over the exact ordered candidate set."""
+    """One random choice over the exact ordered candidate set."""
 
     state_path: tuple[Hashable, ...]
     candidates: tuple[Hashable, ...]
     chosen_action: Hashable
+    sampling_mode: str = "uniform"
+    cost_coefficient: float = 0.0
+    cost_candidates: tuple[ExpansionCandidateAudit, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,6 +149,7 @@ class IterationAlgorithmAudit:
     cache_cost: CacheCostAudit
     batch_cluster_sizes: tuple[tuple[str, int], ...]
     transition_steps: tuple[TransitionStepAudit, ...] = ()
+    expansion_choice: RandomChoiceAudit | None = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +256,96 @@ class WarmStartBundle:
 
 OnIterationCallback = Callable[[IterationRecord], None]
 OnCheckpointCallback = Callable[[SearchResult], None]
+
+
+def _sample_expansion_choice(
+    *,
+    state: SearchState,
+    actions: tuple[Hashable, ...],
+    state_path: tuple[Hashable, ...],
+    rng: random.Random,
+    scorer: ScoreFunction,
+    cost_model: CostModel,
+    context: SearchContext,
+    iteration: int,
+) -> tuple[Hashable, RandomChoiceAudit]:
+    """Sample a uniform expansion proposal with an optional cost tilt."""
+
+    if not actions:
+        raise ValueError("expansion actions must be non-empty")
+    coefficient = 0.0
+    cost_scale = 1.0
+    if isinstance(scorer, CostAwareUCTScorer):
+        coefficient = scorer.expansion_cost_coefficient(iteration)
+        cost_scale = scorer.cost_scale
+
+    if coefficient <= 0.0:
+        chosen = rng.choice(actions)
+        return chosen, RandomChoiceAudit(
+            state_path=state_path,
+            candidates=actions,
+            chosen_action=chosen,
+        )
+
+    marginal_costs: list[float] = []
+    normalized_costs: list[float] = []
+    for action in actions:
+        marginal_cost = float(cost_model.marginal_cost(state, action, context))
+        if not math.isfinite(marginal_cost) or marginal_cost < 0.0:
+            raise ValueError(
+                "expansion marginal costs must be finite and non-negative"
+            )
+        marginal_costs.append(marginal_cost)
+        normalized_costs.append(marginal_cost / cost_scale)
+
+    base_logprob = -math.log(len(actions))
+    log_biases = tuple(-coefficient * cost for cost in normalized_costs)
+    log_weights = tuple(base_logprob + bias for bias in log_biases)
+    maximum = max(log_weights)
+    log_normalizer = maximum + math.log(
+        math.fsum(math.exp(value - maximum) for value in log_weights)
+    )
+    final_logprobs = tuple(value - log_normalizer for value in log_weights)
+
+    biases_equal = all(
+        math.isclose(value, log_biases[0], rel_tol=0.0, abs_tol=1e-15)
+        for value in log_biases[1:]
+    )
+    if biases_equal:
+        chosen = rng.choice(actions)
+        chosen_index = actions.index(chosen)
+    else:
+        threshold = rng.random()
+        cumulative = 0.0
+        chosen_index = len(actions) - 1
+        for index, logprob in enumerate(final_logprobs):
+            cumulative += math.exp(logprob)
+            if threshold <= cumulative:
+                chosen_index = index
+                break
+        chosen = actions[chosen_index]
+
+    candidate_audit = tuple(
+        ExpansionCandidateAudit(
+            action=action,
+            marginal_cost=marginal_costs[index],
+            normalized_marginal_cost=normalized_costs[index],
+            cost_scale=cost_scale,
+            base_logprob=base_logprob,
+            log_bias=log_biases[index],
+            final_logprob=final_logprobs[index],
+            selected=index == chosen_index,
+        )
+        for index, action in enumerate(actions)
+    )
+    return chosen, RandomChoiceAudit(
+        state_path=state_path,
+        candidates=actions,
+        chosen_action=chosen,
+        sampling_mode="cost_tilted_uniform",
+        cost_coefficient=coefficient,
+        cost_candidates=candidate_audit,
+    )
 
 
 def random_rollout(state: SearchState, rng: random.Random) -> SearchState:
@@ -531,13 +645,23 @@ class UCTSearchEngine:
             expanded = False
             expanded_action: Hashable | None = None
             expansion_candidates: tuple[Hashable, ...] = ()
+            expansion_choice: RandomChoiceAudit | None = None
             transition_steps: list[TransitionStepAudit] = []
             transition_effects: list[TransitionResult] = []
             if not node.state.is_terminal():
                 unexpanded = node.unexpanded_actions()
                 if unexpanded:
                     expansion_candidates = tuple(unexpanded)
-                    action = rng.choice(unexpanded)
+                    action, expansion_choice = _sample_expansion_choice(
+                        state=node.state,
+                        actions=expansion_candidates,
+                        state_path=selection_path,
+                        rng=rng,
+                        scorer=self.scorer,
+                        cost_model=self.cost_model,
+                        context=context,
+                        iteration=iteration,
+                    )
                     transition = self._execute_transition(
                         node.state,
                         action,
@@ -710,6 +834,7 @@ class UCTSearchEngine:
                 ),
                 batch_cluster_sizes=batch_cluster_sizes,
                 transition_steps=tuple(transition_steps),
+                expansion_choice=expansion_choice,
             )
 
             if on_iteration is not None:
@@ -876,22 +1001,54 @@ class UCTSearchEngine:
         best_score = float("-inf")
         best_child: TreeNode | None = None
         best_action: Hashable | None = None
-        candidates: list[tuple[Hashable, TreeNode, float, float]] = []
+        candidates: list[
+            tuple[Hashable, TreeNode, float, float, float, float, float, float]
+        ] = []
         for action, child in node.children.items():
             marginal_cost = self.cost_model.marginal_cost(
                 node.state,
                 action,
                 context,
             )
-            score = self.scorer.score(
-                parent_visits=node.visit_count,
-                child_visits=child.visit_count,
-                child_q=child.q_value,
-                marginal_cost=marginal_cost,
-                exploration_constant=self.exploration_constant,
-                iteration=iteration,
+            if isinstance(self.scorer, CostAwareUCTScorer):
+                terms = self.scorer.decompose(
+                    parent_visits=node.visit_count,
+                    child_visits=child.visit_count,
+                    child_q=child.q_value,
+                    marginal_cost=marginal_cost,
+                    exploration_constant=self.exploration_constant,
+                    iteration=iteration,
+                )
+                score = terms.selection_score
+                normalized_cost = terms.normalized_marginal_cost
+                cost_scale = terms.cost_scale
+                cost_coefficient = terms.selection_cost_coefficient
+                uct_score = terms.uct_score
+            else:
+                score = self.scorer.score(
+                    parent_visits=node.visit_count,
+                    child_visits=child.visit_count,
+                    child_q=child.q_value,
+                    marginal_cost=marginal_cost,
+                    exploration_constant=self.exploration_constant,
+                    iteration=iteration,
+                )
+                normalized_cost = float(marginal_cost)
+                cost_scale = 1.0
+                cost_coefficient = 0.0
+                uct_score = float(score)
+            candidates.append(
+                (
+                    action,
+                    child,
+                    float(marginal_cost),
+                    float(score),
+                    normalized_cost,
+                    cost_scale,
+                    cost_coefficient,
+                    uct_score,
+                )
             )
-            candidates.append((action, child, marginal_cost, score))
             if score > best_score:
                 best_score = score
                 best_child = child
@@ -902,6 +1059,17 @@ class UCTSearchEngine:
             )
         if audit_steps is not None:
             assert best_action is not None
+            best_uct_score = max(candidate[7] for candidate in candidates)
+            uct_argmax_actions = {
+                candidate[0]
+                for candidate in candidates
+                if math.isclose(
+                    candidate[7],
+                    best_uct_score,
+                    rel_tol=0.0,
+                    abs_tol=1e-15,
+                )
+            }
             audit_steps.append(
                 SelectionStepAudit(
                     parent_path=self._node_path(node),
@@ -916,8 +1084,24 @@ class UCTSearchEngine:
                             marginal_cost=float(marginal_cost),
                             score=float(score),
                             selected=action == best_action,
+                            normalized_marginal_cost=normalized_cost,
+                            cost_scale=cost_scale,
+                            cost_coefficient=cost_coefficient,
+                            uct_score=uct_score,
                         )
-                        for action, child, marginal_cost, score in candidates
+                        for (
+                            action,
+                            child,
+                            marginal_cost,
+                            score,
+                            normalized_cost,
+                            cost_scale,
+                            cost_coefficient,
+                            uct_score,
+                        ) in candidates
+                    ),
+                    cost_penalty_changed_argmax=(
+                        best_action not in uct_argmax_actions
                     ),
                 )
             )

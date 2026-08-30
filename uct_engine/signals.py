@@ -139,6 +139,9 @@ def export_search_signals(
                     exploration_constant=exploration_constant,
                     iteration=signal_iteration,
                 )
+                expansion_coefficient = scorer.expansion_cost_coefficient(
+                    signal_iteration
+                )
                 action_path = (*_node_path(node), action)
                 scored_actions.append(
                     (
@@ -155,7 +158,19 @@ def export_search_signals(
                             "child_q_raw": terms.child_q_raw,
                             "exploration_bonus": terms.exploration_bonus,
                             "marginal_cost": terms.marginal_cost,
+                            "normalized_marginal_cost": (
+                                terms.normalized_marginal_cost
+                            ),
+                            "cost_scale": terms.cost_scale,
                             "lambda_t": terms.lambda_t,
+                            "selection_cost_coefficient": (
+                                terms.selection_cost_coefficient
+                            ),
+                            "expansion_cost_coefficient": expansion_coefficient,
+                            "expansion_log_bias": (
+                                -expansion_coefficient
+                                * terms.normalized_marginal_cost
+                            ),
                             "cost_penalty_schedule": terms.cost_schedule,
                             "decayed_cost_penalty": terms.decayed_cost_penalty,
                             "uct_score": terms.uct_score,
@@ -207,7 +222,12 @@ def export_search_signals(
                     "selection_mode": (
                         "agent_uct_argmax_if_node_reached"
                         if fully_expanded
-                        else "random_expansion"
+                        else (
+                            "cost_tilted_expansion"
+                            if scorer.expansion_cost_coefficient(signal_iteration)
+                            > 0.0
+                            else "random_expansion"
+                        )
                     ),
                     "agent_uct_snapshot_argmax_action": (
                         None
@@ -255,6 +275,9 @@ def export_search_signals(
             "reuse_graph_scope": "logical_materialized_keys",
             "batch_basis": "provided_context.current_batch",
             "cost_penalty_schedule": scorer.schedule.value,
+            "cost_aware_selection": scorer.cost_aware_selection,
+            "cost_aware_expansion": scorer.cost_aware_expansion,
+            "cost_scale": scorer.cost_scale,
         },
         "context_current_batch_cluster_sizes": (
             []

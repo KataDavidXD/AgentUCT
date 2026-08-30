@@ -10,9 +10,10 @@ layer.
 ## Why agent-uct
 
 Ordinary UCT treats every candidate evaluation as equally expensive. Agent-UCT
-keeps raw task reward as its optimization target while adding a decaying
-marginal-cost penalty to tree selection. Integrations can therefore expose real
-reuse without coupling the search core to one RAG stack or execution backend.
+keeps raw task reward as its optimization target while adding a scheduled,
+globally normalized marginal-cost treatment to explicitly enabled search
+decision sites. Integrations can therefore expose real reuse without coupling
+the search core to one RAG stack or execution backend.
 
 ## How the method works
 
@@ -21,16 +22,25 @@ At iteration `t`, the default inverse-square-root schedule scores a child with:
 ```text
 Q(s, a)
 + c_uct * sqrt(log(N(s) + 1) / (N(s, a) + 1))
-- (lambda_0 / sqrt(t)) * marginal_cost(s, a)
+- (lambda_0 / sqrt(t)) * marginal_cost(s, a) / cost_scale
 ```
 
-The cost term changes selection only. Evaluation, backpropagation, and final
-best-state selection use the evaluator's finite raw reward.
+The backward-compatible defaults apply the cost term to existing-child
+selection only, use the inverse-square-root schedule, and set
+`cost_scale=1.0`. Evaluation, backpropagation, and final best-state selection
+always use the evaluator's finite raw reward.
 
 `CostAwareUCTScorer(lambda_0=beta_c, schedule="constant")` instead uses the
 same constant `beta_c` at every iteration. The default remains
 `schedule="inverse_sqrt"` for backward compatibility. With `lambda_0=0`, both
 schedules reduce exactly to vanilla UCT.
+
+`cost_aware_selection` and `cost_aware_expansion` are independent switches.
+When expansion is enabled, the engine samples the historical uniform proposal
+after applying `exp(-beta_t * DeltaC / cost_scale)` and records every raw cost,
+normalized cost, log bias, final probability, and selected action. Rollout is
+still uniformly sampled and cost-blind; changing rollout policy is a separate,
+explicitly labelled algorithm extension.
 
 ## UCT signal export and ablation
 
@@ -41,8 +51,9 @@ payload = engine.export_search_signals(result, iteration=next_iteration)
 ```
 
 The returned dictionary is strict-JSON-safe and contains every actionable
-node and action: parent/child `N`, raw `Q`, exploration bonus, marginal cost,
-`lambda_t`, decayed cost penalty, the cost-free `uct_score`, and the final
+node and action: parent/child `N`, raw `Q`, exploration bonus, raw and normalized
+marginal cost, global `cost_scale`, selection/expansion coefficients, expansion
+log bias, the cost-free `uct_score`, and the final
 `agent_uct_selection_score`. A caller-supplied `encode_value` handles custom
 structured actions. Run the deterministic payload example with:
 
@@ -73,10 +84,10 @@ must pass a matching `context` explicitly.
 
 Logical reuse edges reported by evaluators show the selection-side
 bipartite-graph effect, but do not prove that a physical cache or SQLite
-backend skipped work. At a node with unexpanded actions, the engine uses
-random expansion; the payload marks those scores
-`eligible_for_engine_argmax_if_node_reached=false`. Fully expanded nodes expose
-both `uct_only_snapshot_argmax_action` and
+backend skipped work. At a node with unexpanded actions, the payload labels
+either historical `random_expansion` or explicit `cost_tilted_expansion`;
+those actions are not existing-child argmax candidates. Fully expanded nodes
+expose both `uct_only_snapshot_argmax_action` and
 `agent_uct_snapshot_argmax_action`.
 
 In sampling mode, a `BatchProvider` draws one `EvaluationBatch` before
@@ -115,7 +126,13 @@ from uct_engine import (
 
 engine = UCTSearchEngine(
     evaluator=my_evaluator,
-    scorer=CostAwareUCTScorer(lambda_0=0.05),
+    scorer=CostAwareUCTScorer(
+        lambda_0=0.05,
+        schedule="constant",
+        cost_aware_selection=True,
+        cost_aware_expansion=True,
+        cost_scale=1.0,
+    ),
     cost_model=ReuseAwareCostModel(my_clusters),
     batch_provider=my_batch_provider,
     random_seed=42,
@@ -266,8 +283,10 @@ Run the standard-library test suite:
 python -m unittest discover -s uct_engine\tests -p "test_*.py" -v
 ```
 
-The suite covers search behavior, custom scoring, raw-reward semantics, the
-inverse-square-root cost schedule, item-level keys, exact batch identity,
-context handoff, budget limits, evaluator failures, and repository hygiene.
+The suite covers search behavior, custom scoring, raw-reward semantics,
+constant/inverse-square-root schedules, fixed global cost normalization,
+selection/expansion treatment sites and audit traces, historical RNG identity,
+item-level keys, exact batch identity, context handoff, budget limits,
+evaluator failures, and repository hygiene.
 Checkpoint tests compare uninterrupted and JSON-round-tripped continuations at
 every iteration, including warmed-ledger runs.
