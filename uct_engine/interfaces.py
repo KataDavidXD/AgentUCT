@@ -73,7 +73,11 @@ class ClusterBatch:
 
 @dataclass(frozen=True)
 class EvaluationBatch:
-    """The paper-defined initial batch ``B_t`` for one Agent-UCT iteration."""
+    """An integration-defined evaluation panel.
+
+    The v3 fixed-reward setting uses the same full panel for every evaluation.
+    Optional changing batches are a generic API feature outside that setting.
+    """
 
     clusters: tuple[ClusterBatch, ...]
 
@@ -161,7 +165,13 @@ class Evaluator(ABC):
 
 
 class CostModel(ABC):
-    """Estimate the history-dependent marginal cost of one child prefix."""
+    """Forecast the remaining cost of complete feedback after a child.
+
+    ``marginal_cost`` retains its historical API name. For arXiv v3 it must
+    include the whole unpaid cold suffix and any modeled recurring work,
+    under the declared legal-completion law. It must read pre-decision state
+    without executing work or changing the cache, prices, or search RNG.
+    """
 
     @abstractmethod
     def marginal_cost(

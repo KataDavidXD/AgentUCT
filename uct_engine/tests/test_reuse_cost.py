@@ -1,7 +1,7 @@
 """Tests for ReuseAwareCostModel and cost-aware score interaction.
 
-All tests use bipartite (prefix, cluster_id) keys matching the paper's
-Path_t structure: materialized_keys contains (pi_prefix, z) tuples.
+These legacy helper tests use (prefix, cluster_id) keys. The v3 full-panel
+completion forecast is exercised separately in test_paper_v3.py.
 """
 from __future__ import annotations
 
@@ -177,7 +177,7 @@ class TestReuseAwareCostModel(unittest.TestCase):
 class TestCostAwareBranchPreference(unittest.TestCase):
 
     def test_high_lambda_shifts_preference(self) -> None:
-        """With high lambda_t, the engine should prefer 'cheap' over 'expensive'.
+        """With a high fixed coefficient, prefer 'cheap' over 'expensive'.
 
         Both branches have equal reward. 'cheap' materializes bipartite
         keys after first eval so its marginal cost drops to 0 across all
@@ -198,7 +198,7 @@ class TestCostAwareBranchPreference(unittest.TestCase):
         self.assertGreater(cheap_visits, expensive_visits)
 
     def test_zero_lambda_is_balanced(self) -> None:
-        """With lambda_t=0 (no cost penalty) visits should be roughly even."""
+        """With zero cost penalty, visits should be roughly even."""
         engine_free = UCTSearchEngine(
             evaluator=CostTrackingEvaluator(),
             scorer=CostAwareUCTScorer(lambda_0=0.0),
@@ -219,7 +219,7 @@ class TestCostAwareBranchPreference(unittest.TestCase):
 
 class TestScoreSemantics(unittest.TestCase):
 
-    def test_lambda_decays_as_inverse_square_root(self) -> None:
+    def test_cost_coefficient_is_fixed_across_iterations(self) -> None:
         scorer = CostAwareUCTScorer(lambda_0=0.2)
         at_t1 = scorer.score(
             parent_visits=10,
@@ -239,7 +239,7 @@ class TestScoreSemantics(unittest.TestCase):
         )
 
         self.assertAlmostEqual(at_t1, 0.3)
-        self.assertAlmostEqual(at_t4, 0.5)
+        self.assertAlmostEqual(at_t4, 0.3)
 
     def test_best_configuration_is_selected_by_raw_reward(self) -> None:
         class OneSlotState:

@@ -1,4 +1,4 @@
-"""Agent-UCT selection score and reuse-aware marginal-cost model."""
+"""AgentUCT v3 selection and a legacy direct-prefix cost helper."""
 from __future__ import annotations
 
 import math
@@ -20,23 +20,39 @@ ItemCostFunction = Callable[
 
 
 class CostAwareUCTScorer(ScoreFunction):
-    r"""Compute the paper's Agent-UCT tree-selection score.
+    r"""Compute Equation (5) of arXiv:2607.24162v3.
 
     .. math::
 
         \widehat Q_t(s,a)
         + c_{\mathrm{UCT}}
-          \sqrt{\frac{\log(N_t(s)+1)}{N_t(s,a)+1}}
-        - \frac{\lambda_0}{\sqrt{t}}\widehat{\Delta C}_t(s,a)
+          \sqrt{\frac{\log(N_t(s)+1)}{N_t(s,a)}}
+        - \frac{\beta}{C_{\mathrm{ref}}}\widehat b_t(s,a)
 
     The cost penalty affects selection only. Rewards stored in tree statistics
-    and the final best configuration are not cost-adjusted.
+    and the final best configuration are not cost-adjusted. ``marginal_cost``
+    is the forecast for a complete evaluation, in the same units as ``c_ref``.
+    Unvisited children have priority. ``iteration`` is retained for the scorer
+    interface; the coefficient does not decay with time.
+
+    ``lambda_0`` is a compatibility alias for the fixed coefficient beta/C_ref.
+    Supplying it overrides beta/C_ref; it no longer requests the old schedule.
     """
 
-    def __init__(self, lambda_0: float = 0.0) -> None:
-        if lambda_0 < 0:
-            raise ValueError("lambda_0 must be non-negative")
-        self.lambda_0 = float(lambda_0)
+    def __init__(
+        self, lambda_0: float | None = None, *, beta: float = 2.0,
+        c_ref: float = 1.0,
+    ) -> None:
+        if not math.isfinite(beta) or beta < 0:
+            raise ValueError("beta must be finite and non-negative")
+        if not math.isfinite(c_ref) or c_ref <= 0:
+            raise ValueError("c_ref must be finite and positive")
+        coefficient = beta / c_ref if lambda_0 is None else float(lambda_0)
+        if not math.isfinite(coefficient) or coefficient < 0:
+            raise ValueError("cost coefficient must be finite and non-negative")
+        self.beta = float(beta)
+        self.c_ref = float(c_ref)
+        self.lambda_0 = coefficient
 
     def score(
         self,
@@ -49,22 +65,26 @@ class CostAwareUCTScorer(ScoreFunction):
     ) -> float:
         if parent_visits < 0 or child_visits < 0:
             raise ValueError("visit counts must be non-negative")
-        if marginal_cost < 0:
-            raise ValueError("marginal_cost must be non-negative")
-        if exploration_constant < 0:
-            raise ValueError("exploration_constant must be non-negative")
+        if not math.isfinite(marginal_cost) or marginal_cost < 0:
+            raise ValueError("marginal_cost must be finite and non-negative")
+        if not math.isfinite(exploration_constant) or exploration_constant < 0:
+            raise ValueError("exploration_constant must be finite and non-negative")
         if iteration < 1:
             raise ValueError("iteration must be at least 1")
 
+        if child_visits == 0:
+            return math.inf
         exploration = exploration_constant * math.sqrt(
-            math.log(parent_visits + 1) / (child_visits + 1)
+            math.log(parent_visits + 1) / child_visits
         )
-        lambda_t = self.lambda_0 / math.sqrt(iteration)
-        return child_q + exploration - lambda_t * marginal_cost
+        return child_q + exploration - self.lambda_0 * marginal_cost
 
 
 class ReuseAwareCostModel(CostModel):
-    r"""Estimate marginal cost from cluster- or item-level reuse keys.
+    r"""Legacy direct-prefix helper; not v3 complete-evaluation pricing.
+
+    This estimates only the immediate child. A v3 integration must implement
+    ``CostModel`` to price every missing resource needed for a complete reward.
 
     With ``context.current_batch`` set, this implements the item-level formula
 

@@ -1,9 +1,9 @@
 """Backend-agnostic Agent-UCT tree search.
 
-Each iteration follows the paper boundary:
+Each iteration follows the complete-feedback boundary:
 
 1. draw one optional initial batch ``B_t``;
-2. select with reuse-aware marginal cost computed from that batch;
+2. select using a caller-supplied complete-evaluation forecast;
 3. expand and complete a configuration;
 4. evaluate with the same batch;
 5. merge only evaluator-reported reuse keys;
@@ -293,9 +293,12 @@ class UCTSearchEngine:
         cannot seed Q/visits without supplying the matching ledger, or supply
         a warm ledger without the matching seeds.
 
-        ``max_cost`` is checked before a new iteration and after each atomic
-        evaluation. An individual evaluation may therefore cross the boundary;
-        the core cannot safely interrupt an external evaluator mid-call.
+        ``max_cost`` stops further iterations once already recorded actual cost
+        reaches the target. No predicted bill is used to admit an evaluation.
+        The crossing evaluation completes and remains in this raw result.
+        Reporting a budget requires an integration-owned copy of the last
+        complete affordable snapshot; do not use this raw result's later best
+        reward, tree, or cache for an earlier reporting cutoff.
 
         ``on_checkpoint`` is also called for the initialized search boundary
         and after an evaluator exception, because either boundary may contain
@@ -355,7 +358,7 @@ class UCTSearchEngine:
         """Resume a complete checkpoint for ``max_iterations`` more rounds.
 
         Iteration numbers continue at ``checkpoint.completed_iterations + 1``.
-        ``max_cost`` remains an absolute run-level ceiling, not a fresh budget.
+        ``max_cost`` remains an absolute actual-cost stopping target.
         The engine's evaluator, scorer, cost model, and batch provider are used
         for the continuation; the tree, ledger, RNG, and best result come only
         from the checkpoint. ``on_checkpoint`` first receives that restored

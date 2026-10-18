@@ -19,11 +19,11 @@ class TestRepositoryHygiene(unittest.TestCase):
         lowered = readme.lower()
 
         required_sections = (
-            "## Why agent-uct",
+            "## Why AgentUCT",
             "## How the method works",
             "## Quick start",
             "## Integration contract",
-            "## Scope and non-goals",
+            "## Scope",
             "## Testing",
         )
         for section in required_sections:
