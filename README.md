@@ -1,6 +1,6 @@
 # AgentUCT
 
-A small Python search core for **Agent-UCT: Upper Confidence Bounds Applied to
+A Python search core and focused method components for **Agent-UCT: Upper Confidence Bounds Applied to
 Trees for Cost-Aware Agentic Workflow Optimization**.
 
 **Paper:** [arXiv:2607.24162v3](https://arxiv.org/abs/2607.24162v3),
@@ -8,10 +8,11 @@ Trees for Cost-Aware Agentic Workflow Optimization**.
 method and claim scope. [Lean proofs](https://github.com/KataDavidXD/AgentUCT-Lean-Proofs)
 provide the companion mathematical development.
 
-This repository contains the allocation core and a deterministic example. The
-benchmark executor, calibrated estimators, model clients, datasets and experiment
-outputs are outside this release. Running the example checks the API; it does
-not reproduce the paper's HotpotQA or GSM8K results.
+This repository contains tree allocation, online cold-cost forecasts, generated
+program editing, actual-cost accounting and deterministic examples. Benchmark
+executors, calibration data, model clients, datasets and experiment outputs are
+outside this release. The examples check the components; they do not reproduce
+the paper's HotpotQA or GSM8K results.
 
 ## Why AgentUCT
 
@@ -48,11 +49,29 @@ git clone https://github.com/KataDavidXD/AgentUCT.git
 cd AgentUCT
 python -m pip install -e .
 python -m uct_engine.examples.rag_mock_example
+python -m uct_engine.examples.online_cost_example
+python -m uct_engine.examples.edit_mock_example
 ```
 
-The example uses a fixed synthetic panel, fixed terminal rewards, successful
-prefix publication and an exact uniform-completion cold-cost forecast. It is
-deliberately small enough to read in one file.
+The first example uses exact costs on eight synthetic workflows. The second
+uses online prices and sampled completions, including NextC and StaticFull.
+The editing example compares the three published allocation rules using
+synthetic callbacks and demonstrates a complete cost crossing.
+
+## Method components
+
+| Component | Public implementation |
+| --- | --- |
+| Fixed-coefficient UCT allocation with raw backup | [scoring.py](uct_engine/scoring.py), [search.py](uct_engine/search.py) |
+| Online resource prices, 16-sample historical completions, NextC and StaticFull | [completion_cost.py](uct_engine/completion_cost.py) |
+| Prequential proposal/repair plus complete-execution forecast | [edit_cost.py](uct_engine/edit_cost.py) |
+| Progressive-widening program editing and AFlow top-four control | [edit_search.py](uct_engine/edit_search.py) |
+| Exact counted-error proposal history | [proposal_history.py](uct_engine/proposal_history.py) |
+| Actual receipts and independently copied complete reporting snapshots | [accounting.py](uct_engine/accounting.py) |
+
+[The component guide](docs/COMPONENTS.md) maps these implementations to v3,
+explains their inputs and gives short usage examples. This is a selected
+method implementation; the benchmark execution system remains caller-owned.
 
 ## Integration contract
 
@@ -82,10 +101,11 @@ evaluation bill in a v3 integration. `ReuseAwareCostModel` is retained as a
 legacy direct-child helper; it does not implement the v3 completion forecast.
 The example shows a complete forecast through `CostModel`.
 
-The paper's RAG predictor uses online resource-price means and 16 sampled legal
-completions. Those benchmark components are not included here. WTB supplies the
-paper's execution/checkpoint service; this package records only keys reported
-by its evaluator. A logical key alone cannot establish physical reuse.
+`HistoricalCompletionCostModel` implements the RAG-style cold predictor using
+online resource-price means and 16 sampled legal completions. The caller
+supplies its fixed training panel, independently calibrated priors/caps, actual
+receipts and successful cache publications. WTB supplies the paper's execution
+service; a logical key alone cannot establish physical reuse.
 
 ### Actual costs and reporting budgets
 
@@ -99,6 +119,8 @@ snapshot whose cumulative actual search cost is at most that budget**. Preserve
 the crossing evaluation and charges in the raw record. Its reward, best state,
 tree and cache must not enter the earlier retained snapshot. `max_cost` does
 not itself construct a budget-filtered result or select a held-out endpoint.
+Use [accounting.py](uct_engine/accounting.py) to copy caller-supplied complete
+states and select their last affordable reporting snapshot.
 
 ### Warm starts and checkpoints
 
@@ -112,6 +134,12 @@ supplies a lossless `CheckpointCodec` and durable storage.
 iterations and after evaluator failures. Failure recovery state is not a
 completed reporting snapshot. `on_iteration` marks successful complete returns.
 
+`SearchCheckpoint` stores the allocation core's tree, context and search RNG;
+it does not automatically serialize separately owned price models, execution
+caches or proposer state. The generated-program `EditSnapshot` stores only a
+reporting tree and cost boundary. See the guide before treating either as a
+complete backend recovery artifact.
+
 ## Scope
 
 The paper's logarithmic quality-regret result assumes a finite fixed-reward
@@ -122,9 +150,9 @@ superiority, optimal endpoint net value, or a theorem for arbitrary growing
 programs. Python-to-Lean program refinement is not machine-verified.
 
 The companion [proof repository](https://github.com/KataDavidXD/AgentUCT-Lean-Proofs)
-maps the mathematical statements to their assumptions. This public core is
-maintained separately from the research workspace; this release imports no
-workspace snapshots, benchmark records or later research results.
+maps the mathematical statements to their assumptions. The release includes
+only selected method components described in v3; benchmark records, deployment
+configuration and later research results are outside this repository.
 
 ## Compatibility
 
@@ -132,7 +160,8 @@ Version 0.2.0 aligns the scorer with v3: the cost coefficient is constant and
 the exploration denominator is `N_child`. Older versions used
 `lambda_0 / sqrt(t)` and `N_child + 1`. The `lambda_0` keyword remains an alias
 for the fixed coefficient `beta / c_ref`; it no longer requests time decay.
-These changes alter search trajectories. Old checkpoints retain their data
+These changes alter search trajectories. Version 0.3.0 adds the method components
+above without changing the existing core's interfaces. Old checkpoints retain their data
 format, but continuation under a changed scorer has changed policy semantics.
 
 ## Testing
@@ -142,8 +171,9 @@ python -m unittest discover -s uct_engine/tests -p "test_*.py"
 ```
 
 The tests cover scoring, raw rewards, prefix publication, panel identity,
-warm starts, checkpoint continuation and completed cost crossings. They are
-software checks, separate from the paper's empirical results and Lean proofs.
+online price pooling, completion laws, editing, complete cost crossings and
+independent reporting states. They are software checks, separate from the
+paper's empirical results and Lean proofs.
 
 ## Citation
 

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-uct"
-version = "0.2.0"
-description = "Minimal AgentUCT search core aligned with arXiv:2607.24162v3"
+version = "0.3.0"
+description = "AgentUCT allocation and complete-feedback cost models from arXiv:2607.24162v3"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

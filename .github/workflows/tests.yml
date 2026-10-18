@@ -15,3 +15,5 @@ jobs:
           python-version: '3.10'
       - run: python -m unittest discover -s uct_engine/tests -p 'test_*.py'
       - run: python -m uct_engine.examples.rag_mock_example
+      - run: python -m uct_engine.examples.online_cost_example
+      - run: python -m uct_engine.examples.edit_mock_example
